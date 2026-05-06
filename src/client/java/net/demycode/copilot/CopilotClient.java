@@ -23,7 +23,7 @@ public class CopilotClient implements ClientModInitializer {
 
     @Override
     public void onInitializeClient() {
-        LevelRenderEvents.AFTER_TRANSLUCENT_TERRAIN.register(renderer);
+        LevelRenderEvents.COLLECT_SUBMITS.register(renderer);
 
         Path configDir = FabricLoader.getInstance().getConfigDir().resolve("minecraft-copilot");
         try {

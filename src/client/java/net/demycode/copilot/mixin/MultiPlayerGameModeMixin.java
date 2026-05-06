@@ -7,14 +7,20 @@ import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.network.chat.Component;
+import net.minecraft.resources.Identifier;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.InteractionResult;
 import net.minecraft.world.level.Level;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.phys.BlockHitResult;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
+
+import java.util.HashMap;
+import java.util.Map;
 
 @Mixin(MultiPlayerGameMode.class)
 public class MultiPlayerGameModeMixin {
@@ -59,14 +65,33 @@ public class MultiPlayerGameModeMixin {
         final long[] blocksFinal = blocks;
         final boolean[] maskFinal = condMask;
         final BlockPos originFinal = origin;
+        final int maskIdx = CopilotClient.blockMapper.getMaskIdx();
 
-        int maskIdx = CopilotClient.blockMapper.getMaskIdx();
         CopilotClient.sampler.submit(blocksFinal, maskFinal, stepBlocks -> {
-            CopilotClient.LOGGER.info("[Copilot] Received step callback with {} blocks", stepBlocks.length);
-            var state = new SuggestionRenderer.SuggestionState(stepBlocks, maskFinal, originFinal, cs, maskIdx);
-            CopilotClient.renderer.update(state);
+            Map<BlockPos, BlockState> ghostMap = new HashMap<>();
+            for (int y = 0; y < cs; y++) {
+                for (int z = 0; z < cs; z++) {
+                    for (int x = 0; x < cs; x++) {
+                        int idx = y * cs * cs + z * cs + x;
+                        if (maskFinal[idx]) continue;
+                        long blockId = stepBlocks[idx];
+                        if (blockId == 0 || blockId == maskIdx) continue;
+
+                        String name = CopilotClient.blockMapper.toName((int) blockId);
+                        BlockState state = BuiltInRegistries.BLOCK
+                                .getOptional(Identifier.parse(name))
+                                .orElse(Blocks.AIR)
+                                .defaultBlockState();
+                        if (state.isAir()) continue;
+
+                        ghostMap.put(originFinal.offset(x, y, z), state);
+                    }
+                }
+            }
+            CopilotClient.LOGGER.info("[Copilot] Step callback: {} ghost blocks", ghostMap.size());
+            CopilotClient.renderer.update(new SuggestionRenderer.SuggestionState(ghostMap));
         });
-        
+
         CopilotClient.LOGGER.info("[Copilot] Submit call completed");
     }
 }
