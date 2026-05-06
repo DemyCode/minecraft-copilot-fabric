@@ -21,10 +21,13 @@ public class MultiPlayerGameModeMixin {
 
     @Inject(method = "useItemOn", at = @At("RETURN"))
     private void onUseItemOn(LocalPlayer player, InteractionHand hand,
-                             BlockHitResult hitResult,
-                             CallbackInfoReturnable<InteractionResult> cir) {
+                              BlockHitResult hitResult,
+                              CallbackInfoReturnable<InteractionResult> cir) {
         if (!cir.getReturnValue().consumesAction()) return;
-        if (CopilotClient.sampler == null) return;
+        if (CopilotClient.sampler == null) {
+            CopilotClient.LOGGER.info("[Copilot] Sampler is null, skipping inference");
+            return;
+        }
 
         BlockPos placedPos = hitResult.getBlockPos().relative(hitResult.getDirection());
         Level level = player.level();
@@ -50,6 +53,7 @@ public class MultiPlayerGameModeMixin {
             }
         }
 
+        CopilotClient.LOGGER.info("[Copilot] Starting inference for {} blocks", n);
         player.sendSystemMessage(Component.literal("[Copilot] Running inference..."));
 
         final long[] blocksFinal = blocks;
@@ -58,8 +62,11 @@ public class MultiPlayerGameModeMixin {
 
         int maskIdx = CopilotClient.blockMapper.getMaskIdx();
         CopilotClient.sampler.submit(blocksFinal, maskFinal, stepBlocks -> {
+            CopilotClient.LOGGER.info("[Copilot] Received step callback with {} blocks", stepBlocks.length);
             var state = new SuggestionRenderer.SuggestionState(stepBlocks, maskFinal, originFinal, cs, maskIdx);
             CopilotClient.renderer.update(state);
         });
+        
+        CopilotClient.LOGGER.info("[Copilot] Submit call completed");
     }
 }

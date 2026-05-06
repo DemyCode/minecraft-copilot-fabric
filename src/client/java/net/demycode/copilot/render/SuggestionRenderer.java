@@ -2,6 +2,7 @@ package net.demycode.copilot.render;
 
 import com.mojang.blaze3d.vertex.PoseStack;
 import com.mojang.blaze3d.vertex.VertexConsumer;
+import net.demycode.copilot.CopilotClient;
 import net.fabricmc.fabric.api.client.rendering.v1.level.LevelRenderContext;
 import net.fabricmc.fabric.api.client.rendering.v1.level.LevelRenderEvents;
 import net.minecraft.client.Minecraft;
@@ -19,14 +20,24 @@ public class SuggestionRenderer implements LevelRenderEvents.AfterTranslucentTer
 
     private final AtomicReference<SuggestionState> current = new AtomicReference<>();
 
-    public void update(SuggestionState state) { current.set(state); }
-    public void clear() { current.set(null); }
+    public void update(SuggestionState state) {
+        CopilotClient.LOGGER.info("[Copilot] SuggestionRenderer.update called with state: {} blocks", state == null ? 0 : state.blocks().length);
+        current.set(state);
+    }
+    public void clear() {
+        CopilotClient.LOGGER.info("[Copilot] SuggestionRenderer.clear called");
+        current.set(null);
+    }
 
     @Override
     public void afterTranslucentTerrain(LevelRenderContext ctx) {
         SuggestionState state = current.get();
-        if (state == null) return;
+        if (state == null) {
+            CopilotClient.LOGGER.info("[Copilot] SuggestionRenderer.afterTranslucentTerrain: state is null");
+            return;
+        }
 
+        CopilotClient.LOGGER.info("[Copilot] SuggestionRenderer.afterTranslucentTerrain called with {} blocks", state.blocks().length);
         Vec3 cam = Minecraft.getInstance().gameRenderer.getMainCamera().position();
         PoseStack ps = ctx.poseStack();
         MultiBufferSource buffers = ctx.bufferSource();
@@ -54,7 +65,11 @@ public class SuggestionRenderer implements LevelRenderEvents.AfterTranslucentTer
                 }
             }
         }
-        if (drawn > 0) net.demycode.copilot.CopilotClient.LOGGER.info("[Copilot] Rendering {} suggestion boxes", drawn);
+        if (drawn > 0) {
+            net.demycode.copilot.CopilotClient.LOGGER.info("[Copilot] Rendering {} suggestion boxes", drawn);
+        } else {
+            net.demycode.copilot.CopilotClient.LOGGER.info("[Copilot] No suggestion boxes to render (drawn=0)");
+        }
 
         ps.popPose();
     }

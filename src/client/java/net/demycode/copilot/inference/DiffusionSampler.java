@@ -4,9 +4,7 @@ import ai.onnxruntime.OrtException;
 import net.demycode.copilot.CopilotClient;
 
 import java.util.Random;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
+import java.util.concurrent.*;
 import java.util.function.Consumer;
 
 public class DiffusionSampler {
@@ -18,37 +16,94 @@ public class DiffusionSampler {
     private final ExecutorService executor = Executors.newSingleThreadExecutor(r -> {
         Thread t = new Thread(r, "copilot-diffusion");
         t.setDaemon(true);
+        t.setUncaughtExceptionHandler((thread, ex) -> {
+            System.err.println("[Copilot] UNCAUGHT EXCEPTION in " + thread.getName() + ": " + ex);
+            ex.printStackTrace(System.err);
+            CopilotClient.LOGGER.error("[Copilot] UNCAUGHT in diffusion thread", ex);
+        });
+        return t;
+    });
+    private final ScheduledExecutorService watchdog = Executors.newSingleThreadScheduledExecutor(r -> {
+        Thread t = new Thread(r, "copilot-watchdog");
+        t.setDaemon(true);
         return t;
     });
     private final Random rng = new Random();
     private Future<?> currentTask;
+    private volatile int watchdogStep = -1;
+    private volatile String watchdogPhase = "idle";
 
     public DiffusionSampler(OnnxSession session, BlockMapper mapper) {
         this.session = session;
         this.mapper = mapper;
+        System.err.println("[Copilot] DiffusionSampler CONSTRUCTOR called. session=" + session + " mapper=" + mapper);
+        CopilotClient.LOGGER.info("[Copilot] DiffusionSampler CONSTRUCTOR: ready. session={} mapper={}", session, mapper);
+        watchdog.scheduleAtFixedRate(() -> {
+            if (!"idle".equals(watchdogPhase)) {
+                String msg = "[Copilot] WATCHDOG: phase=" + watchdogPhase + " step=" + watchdogStep + "/" + NUM_STEPS;
+                System.err.println(msg);
+                CopilotClient.LOGGER.info(msg);
+            }
+        }, 5, 5, TimeUnit.SECONDS);
     }
 
     public void submit(long[] conditionBlocks, boolean[] condMask, Consumer<long[]> stepCallback) {
-        if (currentTask != null) currentTask.cancel(true);
+        System.err.println("[Copilot] DiffusionSampler.submit() ENTERED");
+        CopilotClient.LOGGER.info("[Copilot] DiffusionSampler.submit() ENTERED");
+
+        if (currentTask != null && !currentTask.isDone()) {
+            System.err.println("[Copilot] DiffusionSampler: cancelling previous task");
+            currentTask.cancel(true);
+        }
 
         int cs = mapper.getChunkSize();
         int n = cs * cs * cs;
         int maskIdx = mapper.getMaskIdx();
 
+        System.err.println("[Copilot] DiffusionSampler.submit: cs=" + cs + " n=" + n + " maskIdx=" + maskIdx);
+        CopilotClient.LOGGER.info("[Copilot] DiffusionSampler.submit: cs={} n={} maskIdx={}", cs, n, maskIdx);
+
+        watchdogStep = 0;
+        watchdogPhase = "submitted";
+
         currentTask = executor.submit(() -> {
+            System.err.println("[Copilot] DiffusionSampler: background thread STARTED on " + Thread.currentThread().getName());
+            CopilotClient.LOGGER.info("[Copilot] DiffusionSampler: background thread STARTED on {}", Thread.currentThread().getName());
+            watchdogPhase = "running";
+
             long[] x = new long[n];
             for (int i = 0; i < n; i++) x[i] = condMask[i] ? conditionBlocks[i] : maskIdx;
+
+            int condCount = 0;
+            for (boolean b : condMask) if (b) condCount++;
+            System.err.println("[Copilot] Initial x: " + condCount + " conditioned, " + (n - condCount) + " masked");
+            CopilotClient.LOGGER.info("[Copilot] Initial x: {} conditioned, {} masked", condCount, n - condCount);
 
             try {
                 float[] lastLogits = null;
                 for (int step = 0; step < NUM_STEPS; step++) {
-                    if (Thread.currentThread().isInterrupted()) return;
+                    if (Thread.currentThread().isInterrupted()) {
+                        System.err.println("[Copilot] Thread interrupted at step " + step);
+                        CopilotClient.LOGGER.info("[Copilot] Thread interrupted at step {}", step);
+                        watchdogPhase = "interrupted";
+                        return;
+                    }
                     float tNow  = 1.0f - (float) step / NUM_STEPS;
                     float tNext = 1.0f - (float) (step + 1) / NUM_STEPS;
 
+                    watchdogStep = step;
+                    watchdogPhase = "onnx_step_" + step;
+
                     long t0 = System.currentTimeMillis();
+                    System.err.println("[Copilot] step " + step + ": calling session.forward tNow=" + tNow);
+                    CopilotClient.LOGGER.info("[Copilot] step {}: calling session.forward tNow={}", step, tNow);
+
                     lastLogits = session.forward(x, condMask, tNow, cs);
-                    CopilotClient.LOGGER.info("[Copilot] onnx forward {}ms", System.currentTimeMillis() - t0);
+
+                    long elapsed = System.currentTimeMillis() - t0;
+                    System.err.println("[Copilot] step " + step + ": forward done in " + elapsed + "ms");
+                    CopilotClient.LOGGER.info("[Copilot] step {}: forward done in {}ms", step, elapsed);
+
                     long[] x0 = sampleFromLogits(lastLogits, cs);
 
                     float unmaskProb = tNow > 1e-6f ? (tNow - tNext) / tNow : 1.0f;
@@ -61,9 +116,11 @@ public class DiffusionSampler {
                     }
                     long nonAir = 0;
                     for (int i = 0; i < n; i++) if (!condMask[i] && x[i] != maskIdx && x[i] != 0) nonAir++;
-                    CopilotClient.LOGGER.info("[Copilot] step {}/{} unmasked={} nonAirPredicted={}", step+1, NUM_STEPS, unmasked, nonAir);
+                    CopilotClient.LOGGER.info("[Copilot] step {}/{} unmasked={} nonAirPredicted={}", step + 1, NUM_STEPS, unmasked, nonAir);
+                    watchdogPhase = "callback_step_" + step;
                     stepCallback.accept(x.clone());
                 }
+                watchdogPhase = "finalizing";
                 if (lastLogits != null) {
                     for (int i = 0; i < n; i++) {
                         if (!condMask[i] && x[i] == maskIdx)
@@ -71,15 +128,28 @@ public class DiffusionSampler {
                     }
                 }
                 stepCallback.accept(x.clone());
+                watchdogPhase = "idle";
+                System.err.println("[Copilot] DiffusionSampler: inference COMPLETED");
+                CopilotClient.LOGGER.info("[Copilot] DiffusionSampler: inference COMPLETED normally");
             } catch (OrtException e) {
-                CopilotClient.LOGGER.error("ONNX inference failed: {}", e.getMessage());
+                watchdogPhase = "error";
+                System.err.println("[Copilot] OrtException: " + e.getMessage());
+                CopilotClient.LOGGER.error("[Copilot] ONNX inference failed: {}", e.getMessage(), e);
+            } catch (Exception e) {
+                watchdogPhase = "error";
+                System.err.println("[Copilot] Unexpected exception in diffusion thread: " + e);
+                e.printStackTrace(System.err);
+                CopilotClient.LOGGER.error("[Copilot] Unexpected exception in diffusion thread", e);
             }
         });
+
+        System.err.println("[Copilot] DiffusionSampler.submit: task submitted, future=" + currentTask);
+        CopilotClient.LOGGER.info("[Copilot] DiffusionSampler.submit: task submitted");
     }
 
     private long[] sampleFromLogits(float[] logits, int cs) {
         int n = cs * cs * cs;
-        int vocabSize = mapper.getVocabSize() + 1;
+        int vocabSize = mapper.getVocabSize();
         long[] result = new long[n];
         for (int i = 0; i < n; i++) {
             float max = Float.NEGATIVE_INFINITY;
