@@ -46,6 +46,7 @@ public class MultiPlayerGameModeMixin {
         long[] blocks = new long[n];
         boolean[] condMask = new boolean[n];
 
+        int unknownBlockCount = 0;
         for (int y = 0; y < cs; y++) {
             for (int z = 0; z < cs; z++) {
                 for (int x = 0; x < cs; x++) {
@@ -53,11 +54,14 @@ public class MultiPlayerGameModeMixin {
                     var state = level.getBlockState(origin.offset(x, y, z));
                     String name = BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString();
                     int blockIdx = CopilotClient.blockMapper.toIdx(name);
+                    if (blockIdx == 0 && !state.isAir()) unknownBlockCount++;
                     blocks[idx] = blockIdx;
                     condMask[idx] = blockIdx != 0;
                 }
             }
         }
+        if (unknownBlockCount > 0)
+            CopilotClient.LOGGER.warn("[Copilot] {} blocks not in vocab — treated as air (unconditioned)", unknownBlockCount);
 
         CopilotClient.LOGGER.info("[Copilot] Starting inference for {} blocks", n);
         player.sendSystemMessage(Component.literal("[Copilot] Running inference..."));
