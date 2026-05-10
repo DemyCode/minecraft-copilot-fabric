@@ -90,9 +90,10 @@ def _build_dataset(files: list[Path], min_fill: float, npy_dir_str: str):
     return {"block_to_idx": block_to_idx, "idx_to_block": idx_to_block}, result_paths
 
 
-def _sample_condition_mask(cs: int) -> np.ndarray:
+def _sample_condition_mask(chunk: np.ndarray, cs: int) -> np.ndarray:
     strategy = random.choices(
         [
+            "non_air_fraction",  # mirrors inference: only non-air blocks conditioned
             "random",
             "bottom_half",
             "top_half",
@@ -101,12 +102,16 @@ def _sample_condition_mask(cs: int) -> np.ndarray:
             "half_axis",
             "thin_strip",
         ],
-        weights=[0.35, 0.20, 0.08, 0.12, 0.12, 0.08, 0.05],
+        weights=[0.30, 0.20, 0.15, 0.06, 0.10, 0.10, 0.06, 0.03],
     )[0]
 
     mask = np.zeros((cs, cs, cs), dtype=bool)
 
-    if strategy == "random":
+    if strategy == "non_air_fraction":
+        keep_frac = random.uniform(0.2, 1.0)
+        mask = (chunk != 0) & (np.random.rand(cs, cs, cs) < keep_frac)
+
+    elif strategy == "random":
         frac = random.uniform(0.15, 0.55)
         mask = np.random.rand(cs, cs, cs) < frac
 
@@ -215,7 +220,7 @@ class MinecraftDataset(Dataset):
             chunk = chunk[:, :, ::-1].copy()
             valid_mask = valid_mask[:, :, ::-1].copy()
 
-        condition_mask = _sample_condition_mask(cs)
+        condition_mask = _sample_condition_mask(chunk, cs)
 
         return {
             "blocks": torch.from_numpy(chunk.astype(np.int64)),

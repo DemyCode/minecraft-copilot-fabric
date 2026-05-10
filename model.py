@@ -99,12 +99,12 @@ class UNetTransformer(nn.Module):
     def __init__(
         self,
         vocab_size: int,
-        embed_dim: int = 128,
-        base_channels: int = 64,
+        embed_dim: int = 192,
+        base_channels: int = 96,
         channel_mult: tuple = (1, 2, 4, 8),
-        num_res_blocks: int = 2,
-        time_dim: int = 256,
-        transformer_layers: int = 8,
+        num_res_blocks: int = 3,
+        time_dim: int = 384,
+        transformer_layers: int = 16,
         transformer_heads: int = 8,
         chunk_size: int = 32,
     ):

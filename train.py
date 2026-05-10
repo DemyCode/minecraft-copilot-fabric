@@ -36,16 +36,16 @@ def parse_args():
     p.add_argument("--weight_decay", type=float, default=1e-2)
     p.add_argument("--warmup_steps", type=int, default=2000)
     p.add_argument("--grad_clip", type=float, default=1.0)
-    p.add_argument("--air_weight", type=float, default=0.1)
+    p.add_argument("--air_weight", type=float, default=0.5)
     p.add_argument("--ema_decay", type=float, default=0.9999)
     p.add_argument("--max_steps", type=int, default=500_000)
     # model
-    p.add_argument("--embed_dim", type=int, default=128)
-    p.add_argument("--base_channels", type=int, default=64)
-    p.add_argument("--num_res_blocks", type=int, default=2)
-    p.add_argument("--transformer_layers", type=int, default=8)
+    p.add_argument("--embed_dim", type=int, default=192)
+    p.add_argument("--base_channels", type=int, default=96)
+    p.add_argument("--num_res_blocks", type=int, default=3)
+    p.add_argument("--transformer_layers", type=int, default=16)
     p.add_argument("--transformer_heads", type=int, default=8)
-    p.add_argument("--time_dim", type=int, default=256)
+    p.add_argument("--time_dim", type=int, default=384)
     # infra
     p.add_argument("--resume", type=str, default=None)
     p.add_argument("--device", type=str, default=None)
@@ -258,7 +258,7 @@ def main():
         start_epoch = ckpt.get("epoch", 0)
         try:
             optim.load_state_dict(ckpt["optim"])
-        except ValueError, RuntimeError:
+        except (ValueError, RuntimeError):
             print("Optimizer state incompatible — fresh optimizer")
         if scaler and ckpt.get("scaler"):
             scaler.load_state_dict(ckpt["scaler"])

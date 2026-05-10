@@ -6,7 +6,7 @@ def compute_loss(
     model: torch.nn.Module,
     blocks: torch.Tensor,
     condition_mask: torch.Tensor,
-    air_weight: float = 0.1,
+    air_weight: float = 0.5,
     valid_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     B = blocks.shape[0]
