@@ -8,6 +8,7 @@ dependencies = [
     "curl-cffi>=0.15.0",
     "matplotlib>=3.9.0",
     "nbtlib>=2.0.4",
+    "onnxscript>=0.7.0",
     "playwright>=1.59.0",
     "plotly>=5.0.0",
     "requests>=2.33.1",

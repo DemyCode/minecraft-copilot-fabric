@@ -209,7 +209,7 @@ def main():
     p.add_argument("--schematic", required=True)
     p.add_argument("--mask", default="non_air", choices=["non_air", "bottom", "top", "random", "shell"])
     p.add_argument("--cut_frac", type=float, default=0.5)
-    p.add_argument("--num_steps", type=int, default=20)
+    p.add_argument("--num_steps", type=int, default=100)
     p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--n_runs", type=int, default=1)
     p.add_argument("--output", default="eval.html")
