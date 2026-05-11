@@ -15,6 +15,7 @@ from tqdm import tqdm
 from dataset import MinecraftDataset
 from diffusion import compute_loss, compute_accuracy
 from model import UNetTransformer
+from new_model import DiT3D
 from viz import save_sample_viz, save_3d_viz
 
 
@@ -30,7 +31,11 @@ def parse_args():
     p.add_argument("--max_files", type=int, default=None)
     p.add_argument("--val_fraction", type=float, default=0.05)
     # training
-    p.add_argument("--batch_size", type=int, default=4)
+    p.add_argument("--batch_size", type=int, default=4,
+                   help="micro-batch size (per device, per forward pass)")
+    p.add_argument("--grad_accum_steps", type=int, default=1,
+                   help="accumulate this many micro-batches before each optimizer step; "
+                        "effective batch size = batch_size * grad_accum_steps")
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight_decay", type=float, default=1e-2)
@@ -39,18 +44,38 @@ def parse_args():
     p.add_argument("--air_weight", type=float, default=0.5)
     p.add_argument("--ema_decay", type=float, default=0.9999)
     p.add_argument("--max_steps", type=int, default=500_000)
-    # model
+    # model (shared)
+    p.add_argument("--model_type", choices=["unet", "dit"], default="unet")
     p.add_argument("--embed_dim", type=int, default=192)
+    p.add_argument("--time_dim", type=int, default=384)
+    # unet-specific
     p.add_argument("--base_channels", type=int, default=96)
     p.add_argument("--num_res_blocks", type=int, default=3)
     p.add_argument("--transformer_layers", type=int, default=16)
     p.add_argument("--transformer_heads", type=int, default=8)
-    p.add_argument("--time_dim", type=int, default=384)
+    # dit-specific
+    p.add_argument("--hidden_dim", type=int, default=512)
+    p.add_argument("--patch_size", type=int, default=2)
+    p.add_argument("--dit_depth", type=int, default=12)
+    p.add_argument("--dit_heads", type=int, default=8)
+    p.add_argument("--mlp_ratio", type=float, default=4.0)
     # infra
     p.add_argument("--resume", type=str, default=None)
     p.add_argument("--device", type=str, default=None)
     p.add_argument("--amp", default=True, action=argparse.BooleanOptionalAction)
     return p.parse_args()
+
+
+def _do_optimizer_step(optim, scaler, model, grad_clip):
+    if scaler:
+        scaler.unscale_(optim)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        scaler.step(optim)
+        scaler.update()
+    else:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        optim.step()
+    optim.zero_grad(set_to_none=True)
 
 
 def train_epoch(
@@ -60,7 +85,10 @@ def train_epoch(
     optim.train()
     total_loss = 0.0
     n = 0
+    accum = args.grad_accum_steps
+    pending = 0  # micro-steps accumulated since last optimizer step
 
+    optim.zero_grad(set_to_none=True)
     bar = tqdm(loader, desc=f"  train", leave=False)
     for batch in bar:
         blocks = batch["blocks"].to(device, non_blocking=True)
@@ -68,32 +96,37 @@ def train_epoch(
         valid = batch["valid_mask"].to(device, non_blocking=True)
 
         with torch.amp.autocast("cuda") if scaler else contextlib.nullcontext():
-            loss = compute_loss(model, blocks, cond, args.air_weight, valid)
+            # Divide loss by accum so gradients sum to the correct average
+            loss = compute_loss(model, blocks, cond, args.air_weight, valid) / accum
 
-        optim.zero_grad(set_to_none=True)
         if scaler:
             scaler.scale(loss).backward()
-            scaler.unscale_(optim)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            scaler.step(optim)
-            scaler.update()
         else:
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            optim.step()
 
+        total_loss += loss.item() * accum  # log the unscaled loss
+        n += 1
+        pending += 1
+
+        if pending == accum:
+            _do_optimizer_step(optim, scaler, model, args.grad_clip)
+            with torch.no_grad():
+                for p_ema, p in zip(ema_model.parameters(), model.parameters()):
+                    p_ema.lerp_(p, 1.0 - args.ema_decay)
+            pending = 0
+            step += 1
+            bar.set_postfix(loss=f"{total_loss/n:.4f}", lr=f"{optim.param_groups[0]['lr']:.2e}")
+
+            if step >= args.max_steps:
+                break
+
+    # flush any remaining accumulated gradients at epoch end
+    if pending > 0:
+        _do_optimizer_step(optim, scaler, model, args.grad_clip)
         with torch.no_grad():
             for p_ema, p in zip(ema_model.parameters(), model.parameters()):
                 p_ema.lerp_(p, 1.0 - args.ema_decay)
-
-        lv = loss.item()
-        total_loss += lv
-        n += 1
         step += 1
-        bar.set_postfix(loss=f"{total_loss/n:.4f}", lr=f"{optim.param_groups[0]['lr']:.2e}")
-
-        if step >= args.max_steps:
-            break
 
     return total_loss / max(1, n), step
 
@@ -102,7 +135,7 @@ def train_epoch(
 def validate(model, loader, device, args):
     model.eval()
     losses = []
-    t_levels = (0.5, 0.8)
+    t_levels = (0.2, 0.4, 0.6, 0.8)
     buckets = {t: {"non_air": [], "common": [], "rare": []} for t in t_levels}
 
     bar = tqdm(loader, desc=f"  val  ", leave=False)
@@ -162,17 +195,31 @@ def main():
     val_loader = DataLoader(val_set, shuffle=False, **loader_kw)
 
     # ── Model ─────────────────────────────────────────────────────────────────
-    model = UNetTransformer(
-        vocab_size=dataset.vocab_size,
-        embed_dim=args.embed_dim,
-        base_channels=args.base_channels,
-        num_res_blocks=args.num_res_blocks,
-        time_dim=args.time_dim,
-        transformer_layers=args.transformer_layers,
-        transformer_heads=args.transformer_heads,
-        chunk_size=args.chunk_size,
-    ).to(device)
-    print(f"Parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M")
+    if args.model_type == "dit":
+        model = DiT3D(
+            vocab_size=dataset.vocab_size,
+            embed_dim=args.embed_dim,
+            hidden_dim=args.hidden_dim,
+            patch_size=args.patch_size,
+            depth=args.dit_depth,
+            num_heads=args.dit_heads,
+            mlp_ratio=args.mlp_ratio,
+            time_dim=args.time_dim,
+            chunk_size=args.chunk_size,
+        ).to(device)
+    else:
+        model = UNetTransformer(
+            vocab_size=dataset.vocab_size,
+            embed_dim=args.embed_dim,
+            base_channels=args.base_channels,
+            num_res_blocks=args.num_res_blocks,
+            time_dim=args.time_dim,
+            transformer_layers=args.transformer_layers,
+            transformer_heads=args.transformer_heads,
+            chunk_size=args.chunk_size,
+        ).to(device)
+    print(f"Model: {args.model_type}  —  {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M params")
+    print(f"Batch: micro={args.batch_size}  accum={args.grad_accum_steps}  effective={args.batch_size * args.grad_accum_steps}")
 
     ema_model = copy.deepcopy(model)
     ema_model.requires_grad_(False).eval()
@@ -196,18 +243,8 @@ def main():
     metrics_csv = run_dir / "metrics.csv"
     with open(metrics_csv, "w", newline="") as f:
         csv.writer(f).writerow(
-            [
-                "epoch",
-                "step",
-                "train_loss",
-                "val_loss",
-                "non_air_t0.5",
-                "common_t0.5",
-                "rare_t0.5",
-                "non_air_t0.8",
-                "common_t0.8",
-                "rare_t0.8",
-            ]
+            ["epoch", "step", "train_loss", "val_loss"]
+            + [f"{m}_t{t}" for t in (0.2, 0.4, 0.6, 0.8) for m in ("non_air", "common", "rare")]
         )
 
     with open(run_dir / "vocab.pkl", "wb") as f:
@@ -273,6 +310,7 @@ def main():
 
     # ── Training loop ─────────────────────────────────────────────────────────
     epoch = start_epoch
+    best_val_loss = float("inf")
     while step < args.max_steps:
         print(f"\nEpoch {epoch}  (step {step}/{args.max_steps})")
 
@@ -293,45 +331,39 @@ def main():
         optim.train()
         model.train()
 
-        print(
-            f"  train_loss={train_loss:.4f}  val_loss={metrics['loss']:.4f}\n"
-            f"  t=0.5  non_air={metrics['t0.5']['non_air']:.3f}"
-            f"  common={metrics['t0.5']['common']:.3f}"
-            f"  rare={metrics['t0.5']['rare']:.3f}\n"
-            f"  t=0.8  non_air={metrics['t0.8']['non_air']:.3f}"
-            f"  common={metrics['t0.8']['common']:.3f}"
-            f"  rare={metrics['t0.8']['rare']:.3f}"
+        acc_lines = "  ".join(
+            f"t={t}  non_air={metrics[f't{t}']['non_air']:.3f}"
+            f"  common={metrics[f't{t}']['common']:.3f}"
+            f"  rare={metrics[f't{t}']['rare']:.3f}"
+            for t in (0.2, 0.4, 0.6, 0.8)
         )
+        print(f"  train_loss={train_loss:.4f}  val_loss={metrics['loss']:.4f}\n  {acc_lines}")
 
         viz_path = str(run_dir / f"viz_epoch{epoch:03d}.png")
         viz3d_path = str(run_dir / f"viz3d_epoch{epoch:03d}.html")
-        model.cpu()
-        ema_model.to(device)
         save_sample_viz(ema_model, viz_blocks[:2], viz_cond[:2], viz_path, step)
         save_3d_viz(
             ema_model, viz_blocks[:2], viz_cond[:2], viz3d_path, step, dataset.idx_to_block
         )
-        ema_model.cpu()
-        model.to(device)
         tqdm.write(f"  viz → {Path(viz_path).name}  {Path(viz3d_path).name}")
 
         with open(metrics_csv, "a", newline="") as f:
             csv.writer(f).writerow(
-                [
-                    epoch,
-                    step,
-                    round(train_loss, 6),
-                    round(metrics["loss"], 6),
-                    round(metrics["t0.5"]["non_air"], 6),
-                    round(metrics["t0.5"]["common"], 6),
-                    round(metrics["t0.5"]["rare"], 6),
-                    round(metrics["t0.8"]["non_air"], 6),
-                    round(metrics["t0.8"]["common"], 6),
-                    round(metrics["t0.8"]["rare"], 6),
+                [epoch, step, round(train_loss, 6), round(metrics["loss"], 6)]
+                + [
+                    round(metrics[f"t{t}"][m], 6)
+                    for t in (0.2, 0.4, 0.6, 0.8)
+                    for m in ("non_air", "common", "rare")
                 ]
             )
 
         save_checkpoint(step, epoch, name=f"epoch{epoch:03d}")
+
+        if metrics["loss"] < best_val_loss:
+            best_val_loss = metrics["loss"]
+            save_checkpoint(step, epoch, name="best")
+            tqdm.write(f"  *** new best val_loss={best_val_loss:.4f} → ckpt_best.pt")
+
         epoch += 1
 
     save_checkpoint(step, epoch, name="final")

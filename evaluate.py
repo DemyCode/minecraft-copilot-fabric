@@ -8,7 +8,8 @@ import torch
 
 from diffusion import sample
 from model import UNetTransformer
-from schematic_loader import load_schematic
+from new_model import DiT3D
+from schematic_loader import load_any
 
 
 def load_model(checkpoint_path: str, device: torch.device):
@@ -17,26 +18,35 @@ def load_model(checkpoint_path: str, device: torch.device):
     with open(os.path.join(run_dir, "vocab.pkl"), "rb") as f:
         vocab = pickle.load(f)
     a = ckpt.get("args", {})
-    model = UNetTransformer(
-        vocab_size=vocab["vocab_size"],
-        embed_dim=a.get("embed_dim", 128),
-        base_channels=a.get("base_channels", 64),
-        num_res_blocks=a.get("num_res_blocks", 2),
-        time_dim=a.get("time_dim", 256),
-        transformer_layers=a.get("transformer_layers", 8),
-        transformer_heads=a.get("transformer_heads", 8),
-        chunk_size=a.get("chunk_size", 32),
-    ).to(device)
+    cs = a.get("chunk_size", 32)
+
+    if a.get("model_type", "unet") == "dit":
+        model = DiT3D(
+            vocab_size=vocab["vocab_size"],
+            embed_dim=a.get("embed_dim", 128),
+            hidden_dim=a.get("hidden_dim", 512),
+            patch_size=a.get("patch_size", 2),
+            depth=a.get("dit_depth", 12),
+            num_heads=a.get("dit_heads", 8),
+            mlp_ratio=a.get("mlp_ratio", 4.0),
+            time_dim=a.get("time_dim", 256),
+            chunk_size=cs,
+        ).to(device)
+    else:
+        model = UNetTransformer(
+            vocab_size=vocab["vocab_size"],
+            embed_dim=a.get("embed_dim", 192),
+            base_channels=a.get("base_channels", 96),
+            num_res_blocks=a.get("num_res_blocks", 3),
+            time_dim=a.get("time_dim", 384),
+            transformer_layers=a.get("transformer_layers", 16),
+            transformer_heads=a.get("transformer_heads", 8),
+            chunk_size=cs,
+        ).to(device)
+
     model.load_state_dict(ckpt.get("ema_model", ckpt["model"]))
     model.eval()
-    cs = a.get("chunk_size", 32)
     return model, vocab, cs
-
-
-def to_indices(blocks_str: np.ndarray, block_to_idx: dict) -> np.ndarray:
-    unique, inverse = np.unique(blocks_str, return_inverse=True)
-    idx = np.array([block_to_idx.get(str(n), 0) for n in unique], dtype=np.int64)
-    return idx[inverse].reshape(blocks_str.shape)
 
 
 def extract_chunk(blocks_str: np.ndarray, cs: int) -> np.ndarray:
@@ -56,10 +66,14 @@ def extract_chunk(blocks_str: np.ndarray, cs: int) -> np.ndarray:
     return chunk
 
 
-def make_mask(cs: int, strategy: str, cut_frac: float) -> np.ndarray:
+def make_mask(cs: int, strategy: str, cut_frac: float, indices: np.ndarray | None = None) -> np.ndarray:
     cut = int(cs * cut_frac)
     mask = np.zeros((cs, cs, cs), dtype=bool)
-    if strategy == "bottom":
+    if strategy == "non_air":
+        # mirrors the Java mod: every non-air block is conditioned
+        assert indices is not None, "non_air strategy requires block indices"
+        mask = indices != 0
+    elif strategy == "bottom":
         mask[:cut] = True
     elif strategy == "top":
         mask[cut:] = True
@@ -193,9 +207,9 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--checkpoint", required=True)
     p.add_argument("--schematic", required=True)
-    p.add_argument("--mask", default="bottom", choices=["bottom", "top", "random", "shell"])
+    p.add_argument("--mask", default="non_air", choices=["non_air", "bottom", "top", "random", "shell"])
     p.add_argument("--cut_frac", type=float, default=0.5)
-    p.add_argument("--num_steps", type=int, default=100)
+    p.add_argument("--num_steps", type=int, default=20)
     p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--n_runs", type=int, default=1)
     p.add_argument("--output", default="eval.html")
@@ -208,16 +222,17 @@ def main():
     idx_to_block = vocab["idx_to_block"]
 
     print(f"Loading: {args.schematic}")
-    blocks_str = load_schematic(args.schematic)
+    blocks_str = load_any(args.schematic)
     h, l, w = blocks_str.shape
     print(f"Schematic size: {h}×{l}×{w}  →  center-cropped to {cs}×{cs}×{cs}")
 
     chunk_str = extract_chunk(blocks_str, cs)
-    original = to_indices(chunk_str, block_to_idx)
+    unique, inverse = np.unique(chunk_str, return_inverse=True)
+    original = np.array([block_to_idx.get(str(n), 0) for n in unique], dtype=np.int64)[inverse].reshape(chunk_str.shape)
     fill = (original != 0).mean()
     print(f"Fill ratio: {fill:.1%}  |  unique blocks: {len(np.unique(original))}")
 
-    condition_mask = make_mask(cs, args.mask, args.cut_frac)
+    condition_mask = make_mask(cs, args.mask, args.cut_frac, indices=original)
     known_pct = condition_mask.mean()
     print(f"Mask: {args.mask}  given={known_pct:.0%}  to-reconstruct={1-known_pct:.0%}")
 
