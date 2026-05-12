@@ -94,7 +94,26 @@ BLOCK_ID_TO_NAME = {
     212: "minecraft:frosted_ice", 213: "minecraft:magma_block",
     214: "minecraft:nether_wart_block", 215: "minecraft:red_nether_bricks",
     216: "minecraft:bone_block", 217: "minecraft:structure_void",
-    218: "minecraft:observer", 251: "minecraft:white_concrete",
+    218: "minecraft:observer",
+    # Shulker boxes (added in 1.11, each color is a separate block ID)
+    219: "minecraft:white_shulker_box", 220: "minecraft:orange_shulker_box",
+    221: "minecraft:magenta_shulker_box", 222: "minecraft:light_blue_shulker_box",
+    223: "minecraft:yellow_shulker_box", 224: "minecraft:lime_shulker_box",
+    225: "minecraft:pink_shulker_box", 226: "minecraft:gray_shulker_box",
+    227: "minecraft:light_gray_shulker_box", 228: "minecraft:cyan_shulker_box",
+    229: "minecraft:purple_shulker_box", 230: "minecraft:blue_shulker_box",
+    231: "minecraft:brown_shulker_box", 232: "minecraft:green_shulker_box",
+    233: "minecraft:red_shulker_box", 234: "minecraft:black_shulker_box",
+    # Glazed terracotta (added in 1.12, each color is a separate block ID)
+    235: "minecraft:white_glazed_terracotta", 236: "minecraft:orange_glazed_terracotta",
+    237: "minecraft:magenta_glazed_terracotta", 238: "minecraft:light_blue_glazed_terracotta",
+    239: "minecraft:yellow_glazed_terracotta", 240: "minecraft:lime_glazed_terracotta",
+    241: "minecraft:pink_glazed_terracotta", 242: "minecraft:gray_glazed_terracotta",
+    243: "minecraft:light_gray_glazed_terracotta", 244: "minecraft:cyan_glazed_terracotta",
+    245: "minecraft:purple_glazed_terracotta", 246: "minecraft:blue_glazed_terracotta",
+    247: "minecraft:brown_glazed_terracotta", 248: "minecraft:green_glazed_terracotta",
+    249: "minecraft:red_glazed_terracotta", 250: "minecraft:black_glazed_terracotta",
+    251: "minecraft:white_concrete",
     252: "minecraft:white_concrete_powder", 255: "minecraft:structure_block",
 }
 
@@ -103,9 +122,6 @@ _COLORS = [
     "pink", "gray", "light_gray", "cyan", "purple", "blue",
     "brown", "green", "red", "black",
 ]
-
-def _colored(base, data):
-    return {(data_val, f"minecraft:{color}_{base}") for data_val, color in enumerate(_COLORS)}
 
 BLOCK_ID_DATA_TO_NAME = {
     # Stone variants
@@ -124,7 +140,7 @@ BLOCK_ID_DATA_TO_NAME = {
     (6, 5): "minecraft:dark_oak_sapling",
     # Sand
     (12, 1): "minecraft:red_sand",
-    # Logs (data & 3 = type, regardless of orientation bits)
+    # Logs: bits 0-1 = wood type, bits 2-3 = axis (12-15 = bark-only, same types)
     **{(17, d): n for d, n in {
         0: "minecraft:oak_log", 1: "minecraft:spruce_log",
         2: "minecraft:birch_log", 3: "minecraft:jungle_log",
@@ -132,6 +148,8 @@ BLOCK_ID_DATA_TO_NAME = {
         6: "minecraft:birch_log", 7: "minecraft:jungle_log",
         8: "minecraft:oak_log", 9: "minecraft:spruce_log",
         10: "minecraft:birch_log", 11: "minecraft:jungle_log",
+        12: "minecraft:oak_log", 13: "minecraft:spruce_log",
+        14: "minecraft:birch_log", 15: "minecraft:jungle_log",
     }.items()},
     # Leaves (data & 3 = type)
     **{(18, d): n for d, n in {
@@ -216,6 +234,40 @@ def _norm(name: str) -> str:
     return name.split("[")[0]
 
 
+def _decode_varints(byte_data, count: int) -> np.ndarray:
+    """Decode VarInt-encoded block indices from Sponge Schematic BlockData.
+
+    The Sponge Schematic format stores BlockData as a TAG_Byte_Array of VarInts.
+    Values < 128 are single-byte; values >= 128 use continuation bytes (high bit set).
+    """
+    raw = np.asarray(byte_data, dtype=np.uint8)
+
+    # Fast path: all bytes have high bit clear → 1-byte VarInts, direct mapping
+    if not (raw & 0x80).any():
+        out = raw[:count].astype(np.int32)
+        if len(out) < count:
+            out = np.pad(out, (0, count - len(out)))
+        return out
+
+    result = np.zeros(count, dtype=np.int32)
+    out_idx = 0
+    in_idx = 0
+    n = len(raw)
+    while out_idx < count and in_idx < n:
+        value = 0
+        shift = 0
+        while in_idx < n:
+            b = int(raw[in_idx])
+            in_idx += 1
+            value |= (b & 0x7F) << shift
+            shift += 7
+            if not (b & 0x80):
+                break
+        result[out_idx] = value
+        out_idx += 1
+    return result
+
+
 def load_schematic(file_path: str) -> np.ndarray:
     global _LOOKUP
     if _LOOKUP is None:
@@ -235,10 +287,7 @@ def load_schematic(file_path: str) -> np.ndarray:
 
     if "Palette" in root and "BlockData" in root:
         palette = {int(v): _norm(str(k)) for k, v in root["Palette"].items()}
-        raw = np.array(root["BlockData"], dtype=np.int32).ravel()
-        if len(raw) < total:
-            raw = np.pad(raw, (0, total - len(raw)))
-        raw = raw[:total].reshape(height, length, width)
+        raw = _decode_varints(root["BlockData"], total).reshape(height, length, width)
         max_id = max(palette.keys()) + 1 if palette else 1
         lookup = np.full(max_id, "minecraft:air", dtype=object)
         for k, v in palette.items():
@@ -274,7 +323,8 @@ def _unpack_litematic(longs: np.ndarray, n: int, bits: int) -> np.ndarray:
     sa = (start >> 6).astype(np.intp)
     ea = ((start + bits - 1) >> 6).astype(np.intp)
     sb = (start & 63).astype(np.uint64)
-    v = longs_u[sa] >> sb
+    sa_safe = np.minimum(sa, len(longs_u) - 1)
+    v = longs_u[sa_safe] >> sb
     straddle = sa != ea
     if straddle.any():
         ea_safe = np.minimum(ea, len(longs_u) - 1)
@@ -282,39 +332,88 @@ def _unpack_litematic(longs: np.ndarray, n: int, bits: int) -> np.ndarray:
     return (v & mask).astype(np.int32)
 
 
+def _parse_litematic_region(region) -> tuple[int, int, int, np.ndarray] | None:
+    """Parse one litematic region. Returns (y_min, z_min, x_min, array) or None."""
+    palette = [_norm(str(b["Name"])) for b in region["BlockStatePalette"]]
+    px = int(region["Position"]["x"])
+    py = int(region["Position"]["y"])
+    pz = int(region["Position"]["z"])
+    sx = int(region["Size"]["x"])
+    sy = int(region["Size"]["y"])
+    sz = int(region["Size"]["z"])
+
+    # Size can be negative when the selection was made in the negative direction
+    if sx < 0:
+        px += sx + 1
+        sx = -sx
+    if sy < 0:
+        py += sy + 1
+        sy = -sy
+    if sz < 0:
+        pz += sz + 1
+        sz = -sz
+
+    total = sx * sy * sz
+    if total == 0:
+        return None
+
+    if len(palette) <= 1:
+        name = palette[0] if palette else "minecraft:air"
+        arr = np.full((sy, sz, sx), name, dtype=object)
+    else:
+        bits = max(int(np.ceil(np.log2(len(palette)))), 2)
+        longs = np.array(region["BlockStates"], dtype=np.int64)
+        indices = _unpack_litematic(longs, total, bits)
+        palette_arr = np.array(palette, dtype=object)
+        arr = palette_arr[indices.clip(0, len(palette) - 1)].reshape(sy, sz, sx)
+
+    return (py, pz, px, arr)
+
+
 def load_litematic(file_path: str) -> np.ndarray:
-    """Load a .litematic file (Litematica mod format). Returns the largest region."""
+    """Load a .litematic file (Litematica mod format).
+
+    All regions are merged into a single bounding-box array. Falls back to the
+    largest region alone if the bounding box would exceed 2048 in any dimension
+    (e.g. regions placed far apart in a survival world).
+    """
     nbt = nbtlib.load(file_path)
     regions = nbt["Regions"]
 
-    best: np.ndarray | None = None
-    best_size = 0
-
+    parsed = []
     for region in regions.values():
-        palette = [_norm(str(b["Name"])) for b in region["BlockStatePalette"]]
-        sx = abs(int(region["Size"]["x"]))
-        sy = abs(int(region["Size"]["y"]))
-        sz = abs(int(region["Size"]["z"]))
-        total = sx * sy * sz
-        if total == 0 or total <= best_size:
-            continue
+        result = _parse_litematic_region(region)
+        if result is not None:
+            parsed.append(result)
 
-        if len(palette) <= 1:
-            name = palette[0] if palette else "minecraft:air"
-            arr = np.full((sy, sz, sx), name, dtype=object)
-        else:
-            bits = max(int(np.ceil(np.log2(len(palette)))), 2)
-            longs = np.array(region["BlockStates"], dtype=np.int64)
-            indices = _unpack_litematic(longs, total, bits)
-            palette_arr = np.array(palette, dtype=object)
-            arr = palette_arr[indices.clip(0, len(palette) - 1)].reshape(sy, sz, sx)
-
-        best_size = total
-        best = arr
-
-    if best is None:
+    if not parsed:
         raise ValueError(f"No valid regions in {file_path}")
-    return best
+
+    if len(parsed) == 1:
+        return parsed[0][3]
+
+    y_min = min(p[0] for p in parsed)
+    z_min = min(p[1] for p in parsed)
+    x_min = min(p[2] for p in parsed)
+    y_max = max(p[0] + p[3].shape[0] for p in parsed)
+    z_max = max(p[1] + p[3].shape[1] for p in parsed)
+    x_max = max(p[2] + p[3].shape[2] for p in parsed)
+
+    H, L, W = y_max - y_min, z_max - z_min, x_max - x_min
+
+    # Guard against regions placed far apart in world coordinates
+    _MAX_DIM = 2048
+    if H > _MAX_DIM or L > _MAX_DIM or W > _MAX_DIM:
+        return max(parsed, key=lambda p: p[3].size)[3]
+
+    combined = np.full((H, L, W), "minecraft:air", dtype=object)
+    for (y0, z0, x0, arr) in parsed:
+        y_off = y0 - y_min
+        z_off = z0 - z_min
+        x_off = x0 - x_min
+        combined[y_off:y_off + arr.shape[0], z_off:z_off + arr.shape[1], x_off:x_off + arr.shape[2]] = arr
+
+    return combined
 
 
 def load_any(file_path: str) -> np.ndarray:
