@@ -174,9 +174,10 @@ def train_epoch(
 
 
 @torch.no_grad()
-def validate(model, loader, device, args):
+def validate(model, loader, device, args, use_amp=False, amp_dtype=torch.bfloat16):
     model.eval()
-    losses = []
+    loss_sum = 0.0
+    n_losses = 0
     vocab_size = model.vocab_size
     correct = torch.zeros(vocab_size, device=device)
     total = torch.zeros(vocab_size, device=device)
@@ -189,7 +190,13 @@ def validate(model, loader, device, args):
         cond = batch["condition_mask"].to(device, non_blocking=True)
         valid = batch["valid_mask"].to(device, non_blocking=True)
 
-        losses.append(compute_loss(model, blocks, cond, args.focal_gamma, valid).item())
+        with (
+            torch.amp.autocast("cuda", dtype=amp_dtype)
+            if use_amp
+            else contextlib.nullcontext()
+        ):
+            loss_sum += compute_loss(model, blocks, cond, args.focal_gamma, valid).item()
+        n_losses += 1
 
         # Per-block accuracy at t=0.5 with fixed seed for a reproducible metric
         B = blocks.shape[0]
@@ -200,7 +207,12 @@ def validate(model, loader, device, args):
 
         x_t = blocks.clone()
         x_t[noise_mask] = model.mask_idx
-        preds = model(x_t, cond, t_tensor).argmax(dim=1)
+        with (
+            torch.amp.autocast("cuda", dtype=amp_dtype)
+            if use_amp
+            else contextlib.nullcontext()
+        ):
+            preds = model(x_t, cond, t_tensor).argmax(dim=1)
 
         eval_mask = noise_mask & valid
         batch_acc = 0.0
@@ -209,7 +221,10 @@ def validate(model, loader, device, args):
             hits = (preds[eval_mask] == true_b).float()
             correct.scatter_add_(0, true_b, hits)
             total.scatter_add_(0, true_b, torch.ones(len(true_b), device=device))
-            batch_acc = hits.mean().item()
+            # non-air only so it is consistent with avg_acc
+            non_air_eval = eval_mask & (blocks != 0)
+            if non_air_eval.any():
+                batch_acc = (preds[non_air_eval] == blocks[non_air_eval]).float().mean().item()
 
         has_so_far = total > 0
         running_non_air = has_so_far & non_air_idx
@@ -218,7 +233,7 @@ def validate(model, loader, device, args):
             if running_non_air.any() else 0.0
         )
         bar.set_postfix(
-            loss=f"{sum(losses) / len(losses):.4f}",
+            loss=f"{loss_sum / n_losses:.4f}",
             acc=f"{batch_acc:.4f}",
             avg_acc=f"{running_acc:.4f}",
         )
@@ -229,7 +244,7 @@ def validate(model, loader, device, args):
     macro_acc = block_acc[non_air].mean().item() if non_air.any() else 0.0
 
     return {
-        "loss":      sum(losses) / max(1, len(losses)),
+        "loss":      loss_sum / max(1, n_losses),
         "macro_acc": macro_acc,
         "n_covered": int(non_air.sum().item()),
     }
@@ -331,20 +346,22 @@ def main():
         tag = name or f"step{current_step:07d}"
         path = run_dir / f"ckpt_{tag}.pt"
         optim.eval()
-        torch.save(
-            {
-                "model": model.state_dict(),
-                "ema_model": ema_model.state_dict(),
-                "optim": optim.state_dict(),
-                "scaler": scaler.state_dict() if scaler else None,
-                "step": current_step,
-                "epoch": current_epoch,
-                "vocab_size": dataset.vocab_size,
-                "args": vars(args),
-            },
-            path,
-        )
-        optim.train()
+        try:
+            torch.save(
+                {
+                    "model": model.state_dict(),
+                    "ema_model": ema_model.state_dict(),
+                    "optim": optim.state_dict(),
+                    "scaler": scaler.state_dict() if scaler else None,
+                    "step": current_step,
+                    "epoch": current_epoch,
+                    "vocab_size": dataset.vocab_size,
+                    "args": vars(args),
+                },
+                path,
+            )
+        finally:
+            optim.train()
         tqdm.write(f"  saved → {path}")
 
     # ── Resume ────────────────────────────────────────────────────────────────
@@ -363,7 +380,7 @@ def main():
         start_epoch = ckpt.get("epoch", 0)
         try:
             optim.load_state_dict(ckpt["optim"])
-        except ValueError, RuntimeError:
+        except (ValueError, RuntimeError):
             print("Optimizer state incompatible — fresh optimizer")
         if scaler and ckpt.get("scaler"):
             scaler.load_state_dict(ckpt["scaler"])
@@ -396,7 +413,7 @@ def main():
         )
 
         optim.eval()
-        metrics = validate(ema_model, val_loader, device, args)
+        metrics = validate(ema_model, val_loader, device, args, use_amp=use_amp, amp_dtype=amp_dtype)
         optim.train()
         model.train()
 

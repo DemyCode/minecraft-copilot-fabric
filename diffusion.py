@@ -6,91 +6,42 @@ def compute_loss(
     model: torch.nn.Module,
     blocks: torch.Tensor,
     condition_mask: torch.Tensor,
-    air_weight: float = 0.5,
+    focal_gamma: float = 2.0,
     valid_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     B = blocks.shape[0]
     device = blocks.device
 
     t = torch.rand(B, device=device)
-    blocks_f = blocks.float()
 
     unknown = ~condition_mask
-    absorb_prob = t[:, None, None, None].expand_as(blocks_f)
-    noise_mask = (torch.rand_like(blocks_f) < absorb_prob) & unknown
+    absorb_prob = t[:, None, None, None].expand(blocks.shape)
+    noise_mask = (torch.rand(blocks.shape, device=device) < absorb_prob) & unknown
 
     x_t = blocks.clone()
     x_t[noise_mask] = model.mask_idx
 
     logits = model(x_t, condition_mask, t)
 
-    # Restrict loss to valid (non-padded) positions
     loss_mask = noise_mask & valid_mask if valid_mask is not None else noise_mask
 
     if not loss_mask.any():
         return logits.sum() * 0.0
 
-    vocab_size = logits.shape[1]
-    weight = torch.ones(vocab_size, device=device)
-    weight[0] = air_weight
+    flat_logits = logits.permute(0, 2, 3, 4, 1)[loss_mask]
+    flat_targets = blocks[loss_mask]
 
-    return F.cross_entropy(
-        logits.permute(0, 2, 3, 4, 1)[loss_mask],
-        blocks[loss_mask],
-        weight=weight,
-    )
+    ce = F.cross_entropy(flat_logits, flat_targets, reduction="none")
+    pt = torch.exp(-ce)
+    focal = (1.0 - pt) ** focal_gamma * ce
 
-
-@torch.no_grad()
-def compute_accuracy(
-    model: torch.nn.Module,
-    blocks: torch.Tensor,
-    condition_mask: torch.Tensor,
-    t: float,
-    common_cutoff: int = 10,
-) -> tuple[float, float, float]:
-    B = blocks.shape[0]
-    device = blocks.device
-
-    t_tensor = torch.full((B,), t, device=device)
-    blocks_f = blocks.float()
-    unknown = ~condition_mask
-    absorb_prob = t_tensor[:, None, None, None].expand_as(blocks_f)
-    with torch.random.fork_rng(devices=[device] if device.type == "cuda" else []):
-        torch.manual_seed(0)
-        noise_mask = (torch.rand_like(blocks_f) < absorb_prob) & unknown
-
-    if not noise_mask.any():
-        return 0.0, 0.0, 0.0
-
-    x_t = blocks.clone()
-    x_t[noise_mask] = model.mask_idx
-
-    logits = model(x_t, condition_mask, t_tensor)
-    preds = logits.argmax(dim=1)
-
-    non_air_mask = noise_mask & (blocks != 0)
-    non_air_acc = (
-        (preds[non_air_mask] == blocks[non_air_mask]).float().mean().item()
-        if non_air_mask.any()
-        else 0.0
-    )
-
-    common_mask = noise_mask & (blocks > 0) & (blocks <= common_cutoff)
-    common_acc = (
-        (preds[common_mask] == blocks[common_mask]).float().mean().item()
-        if common_mask.any()
-        else 0.0
-    )
-
-    rare_mask = noise_mask & (blocks > common_cutoff)
-    rare_acc = (
-        (preds[rare_mask] == blocks[rare_mask]).float().mean().item()
-        if rare_mask.any()
-        else 0.0
-    )
-
-    return non_air_acc, common_acc, rare_acc
+    # Average within each sample first so every schematic contributes equally,
+    # regardless of how many valid voxels it has (small padded schematics vs full chunks).
+    batch_idx = torch.where(loss_mask)[0]
+    per_sample_sum = torch.zeros(B, device=device).scatter_add(0, batch_idx, focal)
+    per_sample_count = loss_mask.flatten(1).sum(1).float()
+    valid = per_sample_count > 0
+    return (per_sample_sum[valid] / per_sample_count[valid]).mean()
 
 
 def _sample_steps(
@@ -111,7 +62,7 @@ def _sample_steps(
     if t_start >= 1.0:
         x[unknown] = mask_idx
     else:
-        noise = torch.rand_like(x.float())
+        noise = torch.rand(x.shape, device=device)
         x[unknown & (noise < t_start)] = mask_idx
 
     t_steps = torch.linspace(t_start, 0.0, num_steps + 1, device=device)
@@ -135,7 +86,7 @@ def _sample_steps(
 
         if t_now > 1e-6:
             unmask_prob = (t_now - t_next) / t_now
-            should_unmask = (torch.rand_like(x.float()) < unmask_prob) & still_masked
+            should_unmask = (torch.rand(x.shape, device=device) < unmask_prob) & still_masked
         else:
             should_unmask = still_masked
 
@@ -160,8 +111,6 @@ def sample(
     temperature: float = 1.0,
     t_start: float = 1.0,
 ) -> torch.Tensor:
-    for _, x in _sample_steps(
-        model, condition, condition_mask, num_steps, temperature, t_start
-    ):
+    for _, x in _sample_steps(model, condition, condition_mask, num_steps, temperature, t_start):
         pass
     return x
