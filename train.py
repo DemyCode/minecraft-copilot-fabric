@@ -10,7 +10,7 @@ from pathlib import Path
 
 import schedulefree
 import torch
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 from dataset import MinecraftDataset
@@ -250,11 +250,29 @@ def main():
         npy_dir=args.npy_dir,
         max_files=args.max_files,
     )
-    n_val = max(1, int(args.val_fraction * len(dataset)))
-    n_train = len(dataset) - n_val
-    train_set, val_set = random_split(
-        dataset, [n_train, n_val], generator=torch.Generator().manual_seed(42)
-    )
+    # ── Train / Val split (stable across resumes) ─────────────────────────────
+    all_paths = dataset._schematic_paths
+    path_to_idx = {str(p): i for i, p in enumerate(all_paths)}
+
+    split_src = Path(args.resume).parent / "val_split.json" if args.resume else None
+    if split_src and split_src.exists():
+        with open(split_src) as f:
+            val_paths = json.load(f)
+        val_indices = [path_to_idx[p] for p in val_paths if p in path_to_idx]
+        print(f"Loaded val split from {split_src} ({len(val_indices)} val files)")
+    else:
+        if split_src:
+            print(f"No val_split.json found at {split_src} — creating fresh deterministic split")
+        rng = torch.Generator().manual_seed(42)
+        perm = torch.randperm(len(all_paths), generator=rng).tolist()
+        n_val = max(1, int(args.val_fraction * len(all_paths)))
+        val_indices = perm[:n_val]
+        val_paths = [str(all_paths[i]) for i in val_indices]
+
+    val_idx_set = set(val_indices)
+    train_indices = [i for i in range(len(all_paths)) if i not in val_idx_set]
+    train_set = Subset(dataset, train_indices)
+    val_set = Subset(dataset, val_indices)
 
     loader_kw = dict(
         batch_size=args.batch_size,
@@ -312,6 +330,9 @@ def main():
         csv.writer(f).writerow(
             ["epoch", "step", "train_loss", "val_loss", "macro_acc"]
         )
+
+    with open(run_dir / "val_split.json", "w") as f:
+        json.dump(val_paths, f)
 
     with open(run_dir / "vocab.pkl", "wb") as f:
         pickle.dump(
@@ -382,7 +403,7 @@ def main():
     else:
         print(f"  Training from scratch")
     print(
-        f"  Dataset        : {n_train} train  /  {len(val_set)} val  ({len(dataset)} total)"
+        f"  Dataset        : {len(train_set)} train  /  {len(val_set)} val  ({len(dataset)} total)"
     )
     print(f"  Vocab size     : {dataset.vocab_size} block types")
     print(f"  Chunk size     : {args.chunk_size}³")
@@ -414,7 +435,7 @@ def main():
         "max_steps": args.max_steps,
         "dataset": {
             "dirs": args.data_dirs,
-            "n_train": n_train,
+            "n_train": len(train_set),
             "n_val": len(val_set),
             "vocab_size": dataset.vocab_size,
             "chunk_size": args.chunk_size,
