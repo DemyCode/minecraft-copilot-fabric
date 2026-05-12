@@ -18,7 +18,6 @@ from pathlib import Path
 
 import torch
 
-from model import UNetTransformer
 from new_model import DiT3D
 
 
@@ -28,29 +27,17 @@ def _load(checkpoint_path: str, device: torch.device):
         vocab = pickle.load(f)
     a = ckpt.get("args", {})
     cs = a.get("chunk_size", 32)
-    if a.get("model_type", "unet") == "dit":
-        model = DiT3D(
-            vocab_size=vocab["vocab_size"],
-            embed_dim=a.get("embed_dim", 128),
-            hidden_dim=a.get("hidden_dim", 512),
-            patch_size=a.get("patch_size", 2),
-            depth=a.get("dit_depth", 12),
-            num_heads=a.get("dit_heads", 8),
-            mlp_ratio=a.get("mlp_ratio", 4.0),
-            time_dim=a.get("time_dim", 256),
-            chunk_size=cs,
-        ).to(device)
-    else:
-        model = UNetTransformer(
-            vocab_size=vocab["vocab_size"],
-            embed_dim=a.get("embed_dim", 192),
-            base_channels=a.get("base_channels", 96),
-            num_res_blocks=a.get("num_res_blocks", 3),
-            time_dim=a.get("time_dim", 384),
-            transformer_layers=a.get("transformer_layers", 16),
-            transformer_heads=a.get("transformer_heads", 8),
-            chunk_size=cs,
-        ).to(device)
+    model = DiT3D(
+        vocab_size=vocab["vocab_size"],
+        embed_dim=a.get("embed_dim", 128),
+        hidden_dim=a.get("hidden_dim", 512),
+        patch_size=a.get("patch_size", 2),
+        depth=a.get("dit_depth", 12),
+        num_heads=a.get("dit_heads", 8),
+        mlp_ratio=a.get("mlp_ratio", 4.0),
+        time_dim=a.get("time_dim", 256),
+        chunk_size=cs,
+    ).to(device)
     model.load_state_dict(ckpt.get("ema_model", ckpt["model"]))
     model.eval()
     return model, vocab, cs

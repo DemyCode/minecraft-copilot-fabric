@@ -12,9 +12,8 @@ Architecture (faithful to the DiT paper, Peebles & Xie 2022):
      (patch_size³ × vocab_size) logits.
   6. Unpatchify → [B, vocab_size, D, H, W].
 
-Drop-in replacement for UNetTransformer:
-  • same forward signature: (x_t, condition_mask, t) → logits
-  • same attributes:        .vocab_size, .mask_idx
+Forward signature: (x_t, condition_mask, t) → logits
+Attributes:        .vocab_size, .mask_idx
 """
 
 import torch

@@ -70,13 +70,25 @@ def compute_accuracy(
     preds = logits.argmax(dim=1)
 
     non_air_mask = noise_mask & (blocks != 0)
-    non_air_acc = (preds[non_air_mask] == blocks[non_air_mask]).float().mean().item() if non_air_mask.any() else 0.0
+    non_air_acc = (
+        (preds[non_air_mask] == blocks[non_air_mask]).float().mean().item()
+        if non_air_mask.any()
+        else 0.0
+    )
 
     common_mask = noise_mask & (blocks > 0) & (blocks <= common_cutoff)
-    common_acc = (preds[common_mask] == blocks[common_mask]).float().mean().item() if common_mask.any() else 0.0
+    common_acc = (
+        (preds[common_mask] == blocks[common_mask]).float().mean().item()
+        if common_mask.any()
+        else 0.0
+    )
 
     rare_mask = noise_mask & (blocks > common_cutoff)
-    rare_acc = (preds[rare_mask] == blocks[rare_mask]).float().mean().item() if rare_mask.any() else 0.0
+    rare_acc = (
+        (preds[rare_mask] == blocks[rare_mask]).float().mean().item()
+        if rare_mask.any()
+        else 0.0
+    )
 
     return non_air_acc, common_acc, rare_acc
 
@@ -148,21 +160,8 @@ def sample(
     temperature: float = 1.0,
     t_start: float = 1.0,
 ) -> torch.Tensor:
-    for _, x in _sample_steps(model, condition, condition_mask, num_steps, temperature, t_start):
+    for _, x in _sample_steps(
+        model, condition, condition_mask, num_steps, temperature, t_start
+    ):
         pass
     return x
-
-
-@torch.no_grad()
-def sample_progressive(
-    model: torch.nn.Module,
-    condition: torch.Tensor,
-    condition_mask: torch.Tensor,
-    num_steps: int = 100,
-    temperature: float = 1.0,
-    yield_every: int = 5,
-    t_start: float = 1.0,
-):
-    for step, x in _sample_steps(model, condition, condition_mask, num_steps, temperature, t_start):
-        if step == -1 or step % yield_every == 0 or step == num_steps - 1:
-            yield x.clone()

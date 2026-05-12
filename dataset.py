@@ -201,13 +201,13 @@ class MinecraftDataset(Dataset):
         if h < cs or l < cs or w < cs:
             chunk, valid_mask = self._pad_chunk(blocks, cs)
         else:
-            for _ in range(8):
-                y = random.randint(0, h - cs)
-                z = random.randint(0, l - cs)
-                x = random.randint(0, w - cs)
-                chunk = blocks[y : y + cs, z : z + cs, x : x + cs]
-                if (chunk != 0).mean() >= 0.02:
-                    break
+            # for _ in range(8):
+            y = random.randint(0, h - cs)
+            z = random.randint(0, l - cs)
+            x = random.randint(0, w - cs)
+            chunk = blocks[y : y + cs, z : z + cs, x : x + cs]
+                # if (chunk != 0).mean() >= 0.02:
+                #     break
             chunk = np.array(chunk)
             valid_mask = np.ones((cs, cs, cs), dtype=bool)
 
