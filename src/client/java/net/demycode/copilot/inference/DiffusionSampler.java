@@ -2,33 +2,39 @@ package net.demycode.copilot.inference;
 
 import ai.onnxruntime.OrtException;
 import net.demycode.copilot.CopilotClient;
+import net.minecraft.client.Minecraft;
+import net.minecraft.network.chat.Component;
 
-import java.util.Random;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.*;
 import java.util.function.Consumer;
 
 public class DiffusionSampler {
 
-    private static final int NUM_STEPS = 20;
+    private static final int NUM_STEPS = 100;
 
     private final OnnxSession session;
     private final BlockMapper mapper;
-    private final ExecutorService executor = Executors.newSingleThreadExecutor(r -> {
-        Thread t = new Thread(r, "copilot-diffusion");
-        t.setDaemon(true);
-        t.setUncaughtExceptionHandler((thread, ex) -> {
-            System.err.println("[Copilot] UNCAUGHT EXCEPTION in " + thread.getName() + ": " + ex);
-            ex.printStackTrace(System.err);
-            CopilotClient.LOGGER.error("[Copilot] UNCAUGHT in diffusion thread", ex);
-        });
-        return t;
-    });
+    private final java.util.concurrent.ThreadPoolExecutor executor = new java.util.concurrent.ThreadPoolExecutor(
+        1, 1, 0L, TimeUnit.MILLISECONDS,
+        new java.util.concurrent.LinkedBlockingQueue<>(),
+        r -> {
+            Thread t = new Thread(r, "copilot-diffusion");
+            t.setDaemon(true);
+            t.setUncaughtExceptionHandler((thread, ex) -> {
+                System.err.println("[Copilot] UNCAUGHT EXCEPTION in " + thread.getName() + ": " + ex);
+                ex.printStackTrace(System.err);
+                CopilotClient.LOGGER.error("[Copilot] UNCAUGHT in diffusion thread", ex);
+            });
+            return t;
+        }
+    );
     private final ScheduledExecutorService watchdog = Executors.newSingleThreadScheduledExecutor(r -> {
         Thread t = new Thread(r, "copilot-watchdog");
         t.setDaemon(true);
         return t;
     });
-    private final Random rng = new Random();
     private Future<?> currentTask;
     private volatile int watchdogStep = -1;
     private volatile String watchdogPhase = "idle";
@@ -55,6 +61,7 @@ public class DiffusionSampler {
             System.err.println("[Copilot] DiffusionSampler: cancelling previous task");
             currentTask.cancel(true);
         }
+        executor.purge(); // drop any pending-but-not-started tasks from the queue
 
         int cs = mapper.getChunkSize();
         int n = cs * cs * cs;
@@ -94,6 +101,17 @@ public class DiffusionSampler {
                     watchdogStep = step;
                     watchdogPhase = "onnx_step_" + step;
 
+                    // Show t value in action bar (overlay) every step
+                    final int stepSnap = step;
+                    final float tSnap = tNow;
+                    Minecraft.getInstance().execute(() -> {
+                        var player = Minecraft.getInstance().player;
+                        if (player != null) {
+                            player.sendOverlayMessage(
+                                Component.literal("[Copilot] t=" + String.format("%.2f", tSnap) + " (step " + stepSnap + "/" + NUM_STEPS + ")"));
+                        }
+                    });
+
                     long t0 = System.currentTimeMillis();
                     System.err.println("[Copilot] step " + step + ": calling session.forward tNow=" + tNow);
                     CopilotClient.LOGGER.info("[Copilot] step {}: calling session.forward tNow={}", step, tNow);
@@ -104,27 +122,79 @@ public class DiffusionSampler {
                     System.err.println("[Copilot] step " + step + ": forward done in " + elapsed + "ms");
                     CopilotClient.LOGGER.info("[Copilot] step {}: forward done in {}ms", step, elapsed);
 
-                    long[] x0 = sampleFromLogits(lastLogits, cs);
-
-                    float unmaskProb = tNow > 1e-6f ? (tNow - tNext) / tNow : 1.0f;
-                    int unmasked = 0;
+                    // Compute argmax predictions and softmax confidence for each position
+                    int vocabSize = mapper.getVocabSize();
+                    long[] x0 = new long[n];
+                    float[] confidence = new float[n];
                     for (int i = 0; i < n; i++) {
-                        if (!condMask[i] && x[i] == maskIdx && rng.nextFloat() < unmaskProb) {
-                            x[i] = x0[i];
-                            unmasked++;
+                        float maxLogit = Float.NEGATIVE_INFINITY;
+                        int argmax = 0;
+                        for (int c = 0; c < vocabSize; c++) {
+                            float v = lastLogits[c * n + i];
+                            if (v > maxLogit) { maxLogit = v; argmax = c; }
+                        }
+                        // softmax(argmax) = exp(0) / sum_c(exp(logit_c - maxLogit)) = 1 / sum
+                        float sum = 0;
+                        for (int c = 0; c < vocabSize; c++) {
+                            sum += Math.exp(lastLogits[c * n + i] - maxLogit);
+                        }
+                        x0[i] = argmax;
+                        confidence[i] = 1.0f / sum;
+                    }
+
+                    // Collect still-masked positions; only unmask non-air predictions greedily.
+                    // Air positions stay masked until the final argmax pass — avoids wasting
+                    // 80-90% of steps confirming air that the model already settled on early.
+                    List<Integer> stillMasked = new ArrayList<>();
+                    List<Integer> nonAirCandidates = new ArrayList<>();
+                    for (int i = 0; i < n; i++) {
+                        if (!condMask[i] && x[i] == maskIdx) {
+                            stillMasked.add(i);
+                            if (x0[i] != 0) nonAirCandidates.add(i);
                         }
                     }
-                    long nonAir = 0;
-                    for (int i = 0; i < n; i++) if (!condMask[i] && x[i] != maskIdx && x[i] != 0) nonAir++;
-                    CopilotClient.LOGGER.info("[Copilot] step {}/{} unmasked={} nonAirPredicted={}", step + 1, NUM_STEPS, unmasked, nonAir);
+                    if (stillMasked.isEmpty()) break;
+
+                    if (nonAirCandidates.isEmpty()) {
+                        // All remaining masked positions predict air — commit and stop.
+                        CopilotClient.LOGGER.info("[Copilot] step {}/{}: all remaining predict air, stopping early", step + 1, NUM_STEPS);
+                        for (int i : stillMasked) x[i] = x0[i];
+                        stepCallback.accept(x.clone());
+                        stillMasked.clear(); // signal outer finalizer to skip
+                        break;
+                    }
+
+                    // Unmask the most-confident non-air positions (MASKGIT schedule)
+                    if (tNow <= 1e-6f) {
+                        for (int i : nonAirCandidates) x[i] = x0[i];
+                    } else {
+                        float unmaskProb = (tNow - tNext) / tNow;
+                        int nToUnmask = Math.max(1, Math.round(nonAirCandidates.size() * unmaskProb));
+
+                        nonAirCandidates.sort((a, b) -> Float.compare(confidence[b], confidence[a]));
+                        for (int k = 0; k < nToUnmask; k++) {
+                            int i = nonAirCandidates.get(k);
+                            x[i] = x0[i];
+                        }
+                    }
+
+                    long remaining = 0, nonAir = 0;
+                    for (int i = 0; i < n; i++) {
+                        if (!condMask[i] && x[i] == maskIdx) remaining++;
+                        else if (!condMask[i] && x[i] != 0) nonAir++;
+                    }
+                    CopilotClient.LOGGER.info("[Copilot] step {}/{} remaining={} nonAirPredicted={}", step + 1, NUM_STEPS, remaining, nonAir);
                     watchdogPhase = "callback_step_" + step;
                     stepCallback.accept(x.clone());
                 }
+
+                // Fill any remaining masked positions with argmax from last logits
                 watchdogPhase = "finalizing";
                 if (lastLogits != null) {
+                    int vocabSize = mapper.getVocabSize();
                     for (int i = 0; i < n; i++) {
                         if (!condMask[i] && x[i] == maskIdx)
-                            x[i] = argmax(lastLogits, i, mapper.getVocabSize());
+                            x[i] = argmax(lastLogits, i, vocabSize);
                     }
                 }
                 stepCallback.accept(x.clone());
@@ -147,28 +217,14 @@ public class DiffusionSampler {
         CopilotClient.LOGGER.info("[Copilot] DiffusionSampler.submit: task submitted");
     }
 
-    private long[] sampleFromLogits(float[] logits, int cs) {
-        int n = cs * cs * cs;
-        int vocabSize = mapper.getVocabSize();
-        long[] result = new long[n];
-        for (int i = 0; i < n; i++) {
-            float max = Float.NEGATIVE_INFINITY;
-            for (int c = 0; c < vocabSize; c++) { float v = logits[c * n + i]; if (v > max) max = v; }
-            float sum = 0;
-            float[] probs = new float[vocabSize];
-            for (int c = 0; c < vocabSize; c++) { probs[c] = (float) Math.exp(logits[c * n + i] - max); sum += probs[c]; }
-            float r = rng.nextFloat() * sum;
-            int chosen = vocabSize - 1;
-            for (int c = 0; c < vocabSize; c++) { r -= probs[c]; if (r <= 0) { chosen = c; break; } }
-            result[i] = chosen;
-        }
-        return result;
-    }
-
     private long argmax(float[] logits, int idx, int vocabSize) {
         int n = logits.length / vocabSize;
-        long best = 0; float bestVal = Float.NEGATIVE_INFINITY;
-        for (int c = 0; c < vocabSize; c++) { float v = logits[c * n + idx]; if (v > bestVal) { bestVal = v; best = c; } }
+        long best = 0;
+        float bestVal = Float.NEGATIVE_INFINITY;
+        for (int c = 0; c < vocabSize; c++) {
+            float v = logits[c * n + idx];
+            if (v > bestVal) { bestVal = v; best = c; }
+        }
         return best;
     }
 }

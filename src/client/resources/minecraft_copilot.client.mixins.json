@@ -2,7 +2,7 @@
 	"required": true,
 	"package": "net.demycode.copilot.mixin",
 	"compatibilityLevel": "JAVA_25",
-	"client": ["MultiPlayerGameModeMixin"],
+	"client": ["MultiPlayerGameModeMixin", "GameRendererMixin"],
 	"injectors": {
 		"defaultRequire": 1
 	}
