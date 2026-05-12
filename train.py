@@ -2,6 +2,7 @@ import argparse
 import contextlib
 import copy
 import csv
+import json
 import os
 import pickle
 from datetime import datetime
@@ -178,6 +179,8 @@ def validate(model, loader, device, args, use_amp=False, amp_dtype=torch.bfloat1
     model.eval()
     loss_sum = 0.0
     n_losses = 0
+    acc_sum = 0.0
+    n_acc = 0
     vocab_size = model.vocab_size
     correct = torch.zeros(vocab_size, device=device)
     total = torch.zeros(vocab_size, device=device)
@@ -221,32 +224,22 @@ def validate(model, loader, device, args, use_amp=False, amp_dtype=torch.bfloat1
             hits = (preds[eval_mask] == true_b).float()
             correct.scatter_add_(0, true_b, hits)
             total.scatter_add_(0, true_b, torch.ones(len(true_b), device=device))
-            # non-air only so it is consistent with avg_acc
             non_air_eval = eval_mask & (blocks != 0)
             if non_air_eval.any():
                 batch_acc = (preds[non_air_eval] == blocks[non_air_eval]).float().mean().item()
+                acc_sum += batch_acc
+                n_acc += 1
 
-        has_so_far = total > 0
-        running_non_air = has_so_far & non_air_idx
-        running_acc = (
-            (correct[running_non_air] / total[running_non_air].clamp(min=1)).mean().item()
-            if running_non_air.any() else 0.0
-        )
         bar.set_postfix(
             loss=f"{loss_sum / n_losses:.4f}",
             acc=f"{batch_acc:.4f}",
-            avg_acc=f"{running_acc:.4f}",
+            avg_acc=f"{acc_sum / max(1, n_acc):.4f}",
         )
-
-    has_data = total > 0
-    block_acc = torch.where(has_data, correct / total.clamp(min=1), torch.zeros_like(correct))
-    non_air = has_data & non_air_idx
-    macro_acc = block_acc[non_air].mean().item() if non_air.any() else 0.0
 
     return {
         "loss":      loss_sum / max(1, n_losses),
-        "macro_acc": macro_acc,
-        "n_covered": int(non_air.sum().item()),
+        "macro_acc": acc_sum / max(1, n_acc),
+        "n_covered": int((total[non_air_idx] > 0).sum().item()),
     }
 
 
@@ -385,6 +378,77 @@ def main():
         if scaler and ckpt.get("scaler"):
             scaler.load_state_dict(ckpt["scaler"])
         print(f"Resumed from step {step}, epoch {start_epoch}")
+
+    # ── Training summary ──────────────────────────────────────────────────────
+    print()
+    print("=" * 60)
+    print("  TRAINING CONFIGURATION")
+    print("=" * 60)
+    print(f"  Run dir        : {run_dir}")
+    if args.resume:
+        print(f"  Resumed from   : {args.resume}")
+        print(f"  Starting step  : {step}  /  {args.max_steps}")
+        print(f"  Starting epoch : {start_epoch}")
+    else:
+        print(f"  Training from scratch")
+    print(f"  Dataset        : {n_train} train  /  {len(val_set)} val  ({len(dataset)} total)")
+    print(f"  Vocab size     : {dataset.vocab_size} block types")
+    print(f"  Chunk size     : {args.chunk_size}³")
+    print(f"  Model          : DiT3D  depth={args.dit_depth}  heads={args.dit_heads}  "
+          f"hidden={args.hidden_dim}  patch={args.patch_size}  "
+          f"({sum(p.numel() for p in model.parameters()) / 1e6:.1f}M params)")
+    print(f"  Batch          : micro={args.batch_size}  accum={args.grad_accum_steps}  "
+          f"effective={args.batch_size * args.grad_accum_steps}")
+    print(f"  Optimizer      : AdamWScheduleFree  lr={args.lr}  wd={args.weight_decay}  "
+          f"warmup={args.warmup_steps}")
+    print(f"  Loss           : focal  gamma={args.focal_gamma}")
+    print(f"  EMA decay      : {args.ema_decay}")
+    amp_str = f"{args.amp_dtype.upper()}" if use_amp else "disabled"
+    print(f"  AMP            : {amp_str}")
+    print("=" * 60)
+    print()
+
+    run_config = {
+        "run_dir": str(run_dir),
+        "resumed_from": args.resume,
+        "start_step": step,
+        "start_epoch": start_epoch,
+        "max_steps": args.max_steps,
+        "dataset": {
+            "dirs": args.data_dirs,
+            "n_train": n_train,
+            "n_val": len(val_set),
+            "vocab_size": dataset.vocab_size,
+            "chunk_size": args.chunk_size,
+            "min_fill": args.min_fill,
+        },
+        "model": {
+            "type": "DiT3D",
+            "params_M": round(sum(p.numel() for p in model.parameters()) / 1e6, 2),
+            "embed_dim": args.embed_dim,
+            "hidden_dim": args.hidden_dim,
+            "time_dim": args.time_dim,
+            "patch_size": args.patch_size,
+            "depth": args.dit_depth,
+            "heads": args.dit_heads,
+            "mlp_ratio": args.mlp_ratio,
+        },
+        "training": {
+            "batch_size": args.batch_size,
+            "grad_accum_steps": args.grad_accum_steps,
+            "effective_batch_size": args.batch_size * args.grad_accum_steps,
+            "lr": args.lr,
+            "weight_decay": args.weight_decay,
+            "warmup_steps": args.warmup_steps,
+            "grad_clip": args.grad_clip,
+            "focal_gamma": args.focal_gamma,
+            "ema_decay": args.ema_decay,
+            "amp": use_amp,
+            "amp_dtype": args.amp_dtype if use_amp else None,
+        },
+        "started_at": datetime.now().isoformat(),
+    }
+    (run_dir / "config.json").write_text(json.dumps(run_config, indent=2))
 
     # ── Fixed viz batch (loaded once, stays constant) ─────────────────────────
     _viz_batch = next(
