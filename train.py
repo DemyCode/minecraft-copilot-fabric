@@ -14,9 +14,9 @@ from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
 
 from dataset import MinecraftDataset
-from diffusion import compute_loss
+from diffusion import compute_loss, sample
 from new_model import DiT3D
-from viz import save_sample_viz, save_3d_viz
+from viz import save_3d_viz
 
 
 def parse_args():
@@ -52,6 +52,12 @@ def parse_args():
     p.add_argument("--focal_gamma", type=float, default=2.0)
     p.add_argument("--ema_decay", type=float, default=0.9999)
     p.add_argument("--max_steps", type=int, default=500_000)
+    p.add_argument(
+        "--val_num_steps",
+        type=int,
+        default=10,
+        help="MASKGIT denoising steps used for validation accuracy",
+    )
     # model
     p.add_argument("--embed_dim", type=int, default=128)
     p.add_argument("--time_dim", type=int, default=256)
@@ -178,20 +184,15 @@ def train_epoch(
 def validate(model, loader, device, args, use_amp=False, amp_dtype=torch.bfloat16):
     model.eval()
     loss_sum = 0.0
-    n_losses = 0
-    acc_sum = 0.0
-    n_acc = 0
-    vocab_size = model.vocab_size
-    correct = torch.zeros(vocab_size, device=device)
-    total = torch.zeros(vocab_size, device=device)
-
-    non_air_idx = torch.arange(vocab_size, device=device) > 0
+    n_losses  = 0
+    acc_sum   = 0.0
+    n_acc     = 0
 
     bar = tqdm(loader, desc="  val  ", leave=False)
     for batch in bar:
         blocks = batch["blocks"].to(device, non_blocking=True)
-        cond = batch["condition_mask"].to(device, non_blocking=True)
-        valid = batch["valid_mask"].to(device, non_blocking=True)
+        cond   = batch["condition_mask"].to(device, non_blocking=True)
+        valid  = batch["valid_mask"].to(device, non_blocking=True)
 
         with (
             torch.amp.autocast("cuda", dtype=amp_dtype)
@@ -201,13 +202,9 @@ def validate(model, loader, device, args, use_amp=False, amp_dtype=torch.bfloat1
             loss_sum += compute_loss(model, blocks, cond, args.focal_gamma, valid).item()
         n_losses += 1
 
-        # Per-block accuracy at t=0.5 with fixed seed for a reproducible metric
+        # Single forward pass at t=0.5 — same cost as a training step
         B = blocks.shape[0]
-        t_tensor = torch.full((B,), 0.5, device=device)
-        with torch.random.fork_rng(devices=[device] if device.type == "cuda" else []):
-            torch.manual_seed(0)
-            noise_mask = (torch.rand(blocks.shape, device=device) < 0.5) & ~cond
-
+        noise_mask = (torch.rand(blocks.shape, device=device) < 0.5) & ~cond
         x_t = blocks.clone()
         x_t[noise_mask] = model.mask_idx
         with (
@@ -215,20 +212,14 @@ def validate(model, loader, device, args, use_amp=False, amp_dtype=torch.bfloat1
             if use_amp
             else contextlib.nullcontext()
         ):
-            preds = model(x_t, cond, t_tensor).argmax(dim=1)
+            preds = model(x_t, cond, torch.full((B,), 0.5, device=device)).argmax(dim=1)
 
-        eval_mask = noise_mask & valid
+        non_air_eval = noise_mask & valid & (blocks != 0)
         batch_acc = 0.0
-        if eval_mask.any():
-            true_b = blocks[eval_mask]
-            hits = (preds[eval_mask] == true_b).float()
-            correct.scatter_add_(0, true_b, hits)
-            total.scatter_add_(0, true_b, torch.ones(len(true_b), device=device))
-            non_air_eval = eval_mask & (blocks != 0)
-            if non_air_eval.any():
-                batch_acc = (preds[non_air_eval] == blocks[non_air_eval]).float().mean().item()
-                acc_sum += batch_acc
-                n_acc += 1
+        if non_air_eval.any():
+            batch_acc = (preds[non_air_eval] == blocks[non_air_eval]).float().mean().item()
+            acc_sum += batch_acc
+            n_acc   += 1
 
         bar.set_postfix(
             loss=f"{loss_sum / n_losses:.4f}",
@@ -238,8 +229,7 @@ def validate(model, loader, device, args, use_amp=False, amp_dtype=torch.bfloat1
 
     return {
         "loss":      loss_sum / max(1, n_losses),
-        "macro_acc": acc_sum / max(1, n_acc),
-        "n_covered": int((total[non_air_idx] > 0).sum().item()),
+        "macro_acc": acc_sum  / max(1, n_acc),
     }
 
 
@@ -320,7 +310,7 @@ def main():
     metrics_csv = run_dir / "metrics.csv"
     with open(metrics_csv, "w", newline="") as f:
         csv.writer(f).writerow(
-            ["epoch", "step", "train_loss", "val_loss", "macro_acc", "n_covered"]
+            ["epoch", "step", "train_loss", "val_loss", "macro_acc"]
         )
 
     with open(run_dir / "vocab.pkl", "wb") as f:
@@ -373,7 +363,7 @@ def main():
         start_epoch = ckpt.get("epoch", 0)
         try:
             optim.load_state_dict(ckpt["optim"])
-        except (ValueError, RuntimeError):
+        except ValueError, RuntimeError:
             print("Optimizer state incompatible — fresh optimizer")
         if scaler and ckpt.get("scaler"):
             scaler.load_state_dict(ckpt["scaler"])
@@ -391,16 +381,24 @@ def main():
         print(f"  Starting epoch : {start_epoch}")
     else:
         print(f"  Training from scratch")
-    print(f"  Dataset        : {n_train} train  /  {len(val_set)} val  ({len(dataset)} total)")
+    print(
+        f"  Dataset        : {n_train} train  /  {len(val_set)} val  ({len(dataset)} total)"
+    )
     print(f"  Vocab size     : {dataset.vocab_size} block types")
     print(f"  Chunk size     : {args.chunk_size}³")
-    print(f"  Model          : DiT3D  depth={args.dit_depth}  heads={args.dit_heads}  "
-          f"hidden={args.hidden_dim}  patch={args.patch_size}  "
-          f"({sum(p.numel() for p in model.parameters()) / 1e6:.1f}M params)")
-    print(f"  Batch          : micro={args.batch_size}  accum={args.grad_accum_steps}  "
-          f"effective={args.batch_size * args.grad_accum_steps}")
-    print(f"  Optimizer      : AdamWScheduleFree  lr={args.lr}  wd={args.weight_decay}  "
-          f"warmup={args.warmup_steps}")
+    print(
+        f"  Model          : DiT3D  depth={args.dit_depth}  heads={args.dit_heads}  "
+        f"hidden={args.hidden_dim}  patch={args.patch_size}  "
+        f"({sum(p.numel() for p in model.parameters()) / 1e6:.1f}M params)"
+    )
+    print(
+        f"  Batch          : micro={args.batch_size}  accum={args.grad_accum_steps}  "
+        f"effective={args.batch_size * args.grad_accum_steps}"
+    )
+    print(
+        f"  Optimizer      : AdamWScheduleFree  lr={args.lr}  wd={args.weight_decay}  "
+        f"warmup={args.warmup_steps}"
+    )
     print(f"  Loss           : focal  gamma={args.focal_gamma}")
     print(f"  EMA decay      : {args.ema_decay}")
     amp_str = f"{args.amp_dtype.upper()}" if use_amp else "disabled"
@@ -477,18 +475,18 @@ def main():
         )
 
         optim.eval()
-        metrics = validate(ema_model, val_loader, device, args, use_amp=use_amp, amp_dtype=amp_dtype)
+        metrics = validate(
+            ema_model, val_loader, device, args, use_amp=use_amp, amp_dtype=amp_dtype
+        )
         optim.train()
         model.train()
 
         print(
             f"  train_loss={train_loss:.4f}  val_loss={metrics['loss']:.4f}"
-            f"  macro_acc={metrics['macro_acc']:.4f}  ({metrics['n_covered']} blocks covered)"
+            f"  macro_acc={metrics['macro_acc']:.4f}"
         )
 
-        viz_path = str(run_dir / f"viz_epoch{epoch:03d}.png")
         viz3d_path = str(run_dir / f"viz3d_epoch{epoch:03d}.html")
-        save_sample_viz(ema_model, viz_blocks[:2], viz_cond[:2], viz_path, step)
         save_3d_viz(
             ema_model,
             viz_blocks[:2],
@@ -496,8 +494,9 @@ def main():
             viz3d_path,
             step,
             dataset.idx_to_block,
+            num_steps=args.val_num_steps,
         )
-        tqdm.write(f"  viz → {Path(viz_path).name}  {Path(viz3d_path).name}")
+        tqdm.write(f"  viz → {Path(viz3d_path).name}")
 
         with open(metrics_csv, "a", newline="") as f:
             csv.writer(f).writerow(
@@ -507,7 +506,6 @@ def main():
                     round(train_loss, 6),
                     round(metrics["loss"], 6),
                     round(metrics["macro_acc"], 6),
-                    metrics["n_covered"],
                 ]
             )
 

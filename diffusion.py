@@ -82,11 +82,23 @@ def _sample_steps(
         if temperature != 1.0:
             flat_logits = flat_logits / temperature
         probs = F.softmax(flat_logits, dim=-1)
-        x0 = torch.multinomial(probs, 1).squeeze(1).reshape(B, *condition.shape[1:])
+        confidence, predicted = probs.max(dim=-1)
+        x0         = predicted.reshape(B, *condition.shape[1:])
+        confidence  = confidence.reshape(B, *condition.shape[1:])
 
         if t_now > 1e-6:
             unmask_prob = (t_now - t_next) / t_now
-            should_unmask = (torch.rand(x.shape, device=device) < unmask_prob) & still_masked
+            should_unmask = torch.zeros_like(still_masked)
+            for b in range(B):
+                still_b    = still_masked[b]
+                n_b        = int(still_b.sum().item())
+                if n_b == 0:
+                    continue
+                n_to_unmask = max(1, round(n_b * unmask_prob))
+                conf_b      = confidence[b].clone()
+                conf_b[~still_b] = -1.0
+                threshold   = conf_b.reshape(-1).topk(n_to_unmask).values[-1]
+                should_unmask[b] = (conf_b >= threshold) & still_b
         else:
             should_unmask = still_masked
 
