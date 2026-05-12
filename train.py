@@ -8,6 +8,7 @@ import pickle
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
 import schedulefree
 import torch
 from torch.utils.data import DataLoader, Subset
@@ -15,8 +16,8 @@ from tqdm import tqdm
 
 from dataset import MinecraftDataset
 from diffusion import compute_loss, sample
+from eval_utils import metrics as chunk_metrics, save_viz
 from new_model import DiT3D
-from viz import save_3d_viz
 
 
 def parse_args():
@@ -233,6 +234,37 @@ def validate(model, loader, device, args, use_amp=False, amp_dtype=torch.bfloat1
     }
 
 
+def run_eval_viz(ema_model, val_set, viz_indices, idx_to_block, run_dir, epoch, device, args):
+    """Run full diffusion sample on fixed val chunks, save per-chunk HTMLs, return aggregate metrics."""
+    ema_model.eval()
+    agg = {"exact": [], "non_air": [], "hallucinated_frac": [], "missed_frac": []}
+
+    viz_dir = run_dir / f"viz3d_epoch{epoch:03d}"
+    viz_dir.mkdir(exist_ok=True)
+
+    for j, idx in enumerate(viz_indices):
+        item = val_set[idx]
+        blocks = item["blocks"].unsqueeze(0).to(device)
+        cond   = item["condition_mask"].unsqueeze(0).to(device)
+
+        with torch.no_grad():
+            result_t = sample(ema_model, blocks, cond, num_steps=args.val_num_steps, temperature=1.0)
+
+        original_np      = blocks.squeeze(0).cpu().numpy()
+        cond_np          = cond.squeeze(0).cpu().numpy().astype(bool)
+        reconstructed_np = result_t.squeeze(0).cpu().numpy()
+
+        m = chunk_metrics(original_np, reconstructed_np, cond_np)
+        for k in agg:
+            v = m.get(k, float("nan"))
+            if not np.isnan(v):
+                agg[k].append(v)
+
+        save_viz(original_np, cond_np, reconstructed_np, str(viz_dir / f"c{j:02d}.html"), idx_to_block)
+
+    return {k: float(np.mean(v)) if v else float("nan") for k, v in agg.items()}
+
+
 def main():
     args = parse_args()
     device = torch.device(
@@ -327,9 +359,10 @@ def main():
 
     metrics_csv = run_dir / "metrics.csv"
     with open(metrics_csv, "w", newline="") as f:
-        csv.writer(f).writerow(
-            ["epoch", "step", "train_loss", "val_loss", "macro_acc"]
-        )
+        csv.writer(f).writerow([
+            "epoch", "step", "train_loss", "val_loss", "macro_acc",
+            "exact_acc", "non_air_acc", "hallucinated_frac", "missed_frac",
+        ])
 
     with open(run_dir / "val_split.json", "w") as f:
         json.dump(val_paths, f)
@@ -469,12 +502,10 @@ def main():
     }
     (run_dir / "config.json").write_text(json.dumps(run_config, indent=2))
 
-    # ── Fixed viz batch (loaded once, stays constant) ─────────────────────────
-    _viz_batch = next(
-        iter(DataLoader(val_set, batch_size=3, shuffle=False, num_workers=0))
-    )
-    viz_blocks = _viz_batch["blocks"].to(device)
-    viz_cond = _viz_batch["condition_mask"].to(device)
+    # ── Fixed viz indices — 10 random val chunks, same every epoch ───────────
+    _viz_rng = torch.Generator().manual_seed(99)
+    _n_viz = min(10, len(val_set))
+    viz_indices = torch.randperm(len(val_set), generator=_viz_rng)[:_n_viz].tolist()
 
     # ── Training loop ─────────────────────────────────────────────────────────
     epoch = start_epoch
@@ -507,28 +538,29 @@ def main():
             f"  macro_acc={metrics['macro_acc']:.4f}"
         )
 
-        viz3d_path = str(run_dir / f"viz3d_epoch{epoch:03d}.html")
-        save_3d_viz(
-            ema_model,
-            viz_blocks[:2],
-            viz_cond[:2],
-            viz3d_path,
-            step,
-            dataset.idx_to_block,
-            num_steps=args.val_num_steps,
+        viz_metrics = run_eval_viz(
+            ema_model, val_set, viz_indices, dataset.idx_to_block,
+            run_dir, epoch, device, args,
         )
-        tqdm.write(f"  viz → {Path(viz3d_path).name}")
+        tqdm.write(
+            f"  viz → viz3d_epoch{epoch:03d}/  "
+            f"exact={viz_metrics['exact']:.3f}  "
+            f"non_air={viz_metrics['non_air']:.3f}  "
+            f"halluc={viz_metrics['hallucinated_frac']:.3f}  "
+            f"missed={viz_metrics['missed_frac']:.3f}"
+        )
 
         with open(metrics_csv, "a", newline="") as f:
-            csv.writer(f).writerow(
-                [
-                    epoch,
-                    step,
-                    round(train_loss, 6),
-                    round(metrics["loss"], 6),
-                    round(metrics["macro_acc"], 6),
-                ]
-            )
+            csv.writer(f).writerow([
+                epoch, step,
+                round(train_loss, 6),
+                round(metrics["loss"], 6),
+                round(metrics["macro_acc"], 6),
+                round(viz_metrics["exact"], 4),
+                round(viz_metrics["non_air"], 4),
+                round(viz_metrics["hallucinated_frac"], 4),
+                round(viz_metrics["missed_frac"], 4),
+            ])
 
         save_checkpoint(step, epoch, name=f"epoch{epoch:03d}")
 
