@@ -13,6 +13,8 @@ import java.util.function.Consumer;
 public class DiffusionSampler {
 
     private static final int NUM_STEPS = 100;
+    // SPARSE mode: non-air predictions below this softmax confidence are forced to air
+    private static final float SPARSE_THRESHOLD = 0.5f;
 
     private final OnnxSession session;
     private final BlockMapper mapper;
@@ -53,7 +55,7 @@ public class DiffusionSampler {
         }, 5, 5, TimeUnit.SECONDS);
     }
 
-    public void submit(long[] conditionBlocks, boolean[] condMask, Consumer<long[]> stepCallback) {
+    public void submit(long[] conditionBlocks, boolean[] condMask, Consumer<long[]> stepCallback, InferMode mode) {
         System.err.println("[Copilot] DiffusionSampler.submit() ENTERED");
         CopilotClient.LOGGER.info("[Copilot] DiffusionSampler.submit() ENTERED");
 
@@ -87,6 +89,24 @@ public class DiffusionSampler {
             CopilotClient.LOGGER.info("[Copilot] Initial x: {} conditioned, {} masked", condCount, n - condCount);
 
             try {
+                if (mode == InferMode.CLASSIC) {
+                    watchdogPhase = "classic_forward";
+                    float[] logits = session.forward(x, condMask, 1.0f, cs);
+                    int vocabSize = mapper.getVocabSize();
+                    for (int i = 0; i < n; i++) {
+                        if (!condMask[i]) x[i] = argmax(logits, i, vocabSize);
+                    }
+                    stepCallback.accept(x.clone());
+                    watchdogPhase = "idle";
+                    Minecraft.getInstance().execute(() -> {
+                        var player = Minecraft.getInstance().player;
+                        if (player != null)
+                            player.sendOverlayMessage(Component.literal("[Copilot] Classic done"));
+                    });
+                    CopilotClient.LOGGER.info("[Copilot] Classic inference COMPLETED");
+                    return;
+                }
+
                 float[] lastLogits = null;
                 for (int step = 0; step < NUM_STEPS; step++) {
                     if (Thread.currentThread().isInterrupted()) {
@@ -164,9 +184,12 @@ public class DiffusionSampler {
                         break;
                     }
 
-                    // Unmask the most-confident non-air positions (MASKGIT schedule)
+                    // Unmask the most-confident non-air positions (MASKGIT schedule).
+                    // SPARSE mode: positions below the confidence threshold are committed as air
+                    // immediately, preventing low-confidence blocks from snowballing into fill.
                     if (tNow <= 1e-6f) {
-                        for (int i : nonAirCandidates) x[i] = x0[i];
+                        for (int i : nonAirCandidates)
+                            x[i] = (mode == InferMode.SPARSE && confidence[i] < SPARSE_THRESHOLD) ? 0 : x0[i];
                     } else {
                         float unmaskProb = (tNow - tNext) / tNow;
                         int nToUnmask = Math.max(1, Math.round(nonAirCandidates.size() * unmaskProb));
@@ -174,7 +197,7 @@ public class DiffusionSampler {
                         nonAirCandidates.sort((a, b) -> Float.compare(confidence[b], confidence[a]));
                         for (int k = 0; k < nToUnmask; k++) {
                             int i = nonAirCandidates.get(k);
-                            x[i] = x0[i];
+                            x[i] = (mode == InferMode.SPARSE && confidence[i] < SPARSE_THRESHOLD) ? 0 : x0[i];
                         }
                     }
 
@@ -193,8 +216,20 @@ public class DiffusionSampler {
                 if (lastLogits != null) {
                     int vocabSize = mapper.getVocabSize();
                     for (int i = 0; i < n; i++) {
-                        if (!condMask[i] && x[i] == maskIdx)
-                            x[i] = argmax(lastLogits, i, vocabSize);
+                        if (!condMask[i] && x[i] == maskIdx) {
+                            long pred = argmax(lastLogits, i, vocabSize);
+                            if (mode == InferMode.SPARSE && pred != 0) {
+                                float maxLogit = Float.NEGATIVE_INFINITY;
+                                for (int c = 0; c < vocabSize; c++) {
+                                    float v = lastLogits[c * n + i];
+                                    if (v > maxLogit) maxLogit = v;
+                                }
+                                float sum = 0;
+                                for (int c = 0; c < vocabSize; c++) sum += (float) Math.exp(lastLogits[c * n + i] - maxLogit);
+                                pred = (1.0f / sum >= SPARSE_THRESHOLD) ? pred : 0;
+                            }
+                            x[i] = pred;
+                        }
                     }
                 }
                 stepCallback.accept(x.clone());

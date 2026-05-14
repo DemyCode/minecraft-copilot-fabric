@@ -1,6 +1,7 @@
 package net.demycode.copilot.mixin;
 
 import net.demycode.copilot.CopilotClient;
+import net.demycode.copilot.inference.InferMode;
 import net.demycode.copilot.render.SuggestionRenderer;
 import net.minecraft.client.multiplayer.MultiPlayerGameMode;
 import net.minecraft.client.player.LocalPlayer;
@@ -64,10 +65,10 @@ public class MultiPlayerGameModeMixin {
         if (unknownBlockCount > 0)
             CopilotClient.LOGGER.warn("[Copilot] {} blocks not in vocab — treated as air (unconditioned)", unknownBlockCount);
 
-        CopilotClient.LOGGER.info("[Copilot] Starting inference for {} blocks", n);
-        player.sendSystemMessage(Component.literal("[Copilot] Running inference..."));
+        InferMode mode = CopilotClient.inferMode;
+        CopilotClient.LOGGER.info("[Copilot] Starting inference ({}) for {} blocks", mode, n);
+        player.sendSystemMessage(Component.literal("[Copilot] Running inference (" + mode.name().toLowerCase() + ")..."));
 
-        // Move the bounding box to the new zone immediately, clearing old ghost blocks.
         final long[] blocksFinal = blocks;
         final boolean[] maskFinal = condMask;
         final BlockPos originFinal = origin;
@@ -107,7 +108,7 @@ public class MultiPlayerGameModeMixin {
                     .forEach(e -> CopilotClient.LOGGER.info("[Copilot] predicted block: {} x{}", e.getKey(), e.getValue()));
             }
             CopilotClient.renderer.update(new SuggestionRenderer.SuggestionState(ghostMap, originFinal, csFinal));
-        });
+        }, mode);
 
         CopilotClient.LOGGER.info("[Copilot] Submit call completed");
     }
